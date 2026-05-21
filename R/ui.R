@@ -164,6 +164,37 @@ write_background_progress <- function(progress_path, stage, message = NULL, perc
   invisible(progress)
 }
 
+background_parallel_guidance <- function(output_names = character(0)) {
+  list(
+    main_session_available = TRUE,
+    safe_parallel_work = "Lightweight read-only commands in the main session are safe while the async job runs.",
+    avoid_parallel_work = paste(
+      "Avoid long synchronous main-session jobs, mutating the same output objects,",
+      "or writing the same files/directories used by the async job."
+    ),
+    output_names = unname(as.character(output_names)),
+    cancel_note = paste(
+      "Cancelling kills the background process and cleans marshaling tempfiles,",
+      "but it does not roll back durable files already written by user code."
+    )
+  )
+}
+
+background_job_metadata <- function(job_id, job_info) {
+  output_names <- if (!is.null(job_info$output_names)) job_info$output_names else character(0)
+  input_names <- if (!is.null(job_info$input_names)) job_info$input_names else character(0)
+  list(
+    job_id = job_id,
+    agent_id = if (!is.null(job_info$agent_id)) job_info$agent_id else "unknown",
+    session_name = if (!is.null(job_info$session_name)) job_info$session_name else NA_character_,
+    session_port = if (!is.null(job_info$session_port)) job_info$session_port else NA_integer_,
+    started_at = if (!is.null(job_info$started)) format(job_info$started, "%Y-%m-%d %H:%M:%S %Z") else NA_character_,
+    input_names = unname(as.character(input_names)),
+    output_names = unname(as.character(output_names)),
+    main_session_available = TRUE
+  )
+}
+
 #' Start a background R job via callr
 #' @param code R code to execute in a separate process
 #' @param job_id Unique identifier for the job
@@ -257,6 +288,9 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
     started = Sys.time(),
     code = code,
     agent_id = agent_id,
+    session_name = .claude_server_env$session_name,
+    session_port = .claude_server_env$port,
+    input_names = input_names,
     inputs_path = inputs_path,
     outputs_path = outputs_path,
     output_names = output_names,
@@ -273,7 +307,12 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
   )
   .claude_history_env$entries <- c(.claude_history_env$entries, list(history_entry))
 
-  list(success = TRUE, job_id = job_id)
+  list(
+    success = TRUE,
+    job_id = job_id,
+    metadata = background_job_metadata(job_id, .claude_bg_jobs[[job_id]]),
+    parallel_guidance = background_parallel_guidance(output_names)
+  )
 }
 
 #' Kill a running background job
@@ -299,6 +338,7 @@ kill_background_job <- function(job_id) {
 
   # Cleanup marshaling tempfiles regardless of state.
   last_progress <- read_background_progress(job_info$progress_path)
+  metadata <- background_job_metadata(job_id, job_info)
 
   for (p in c(job_info$inputs_path, job_info$outputs_path, job_info$progress_path)) {
     if (!is.null(p) && file.exists(p)) try(file.remove(p), silent = TRUE)
@@ -311,7 +351,13 @@ kill_background_job <- function(job_id) {
     success = TRUE,
     was_alive = was_alive,
     elapsed_seconds = round(elapsed),
-    progress = last_progress
+    progress = last_progress,
+    metadata = metadata,
+    cleanup_note = paste(
+      "Marshaled input/output/progress tempfiles were cleaned.",
+      "Durable files written by the async code are not rolled back automatically."
+    ),
+    parallel_guidance = background_parallel_guidance(metadata$output_names)
   )
 }
 
@@ -330,7 +376,9 @@ check_background_job <- function(job_id) {
     return(list(
       status = "running",
       elapsed_seconds = round(elapsed),
-      progress = read_background_progress(job_info$progress_path)
+      progress = read_background_progress(job_info$progress_path),
+      metadata = background_job_metadata(job_id, job_info),
+      parallel_guidance = background_parallel_guidance(job_info$output_names)
     ))
   }
 
@@ -367,6 +415,7 @@ check_background_job <- function(job_id) {
     }
 
     final_progress <- read_background_progress(job_info$progress_path)
+    metadata <- background_job_metadata(job_id, job_info)
     cleanup_files()
     rm(list = job_id, envir = .claude_bg_jobs)
 
@@ -376,15 +425,26 @@ check_background_job <- function(job_id) {
     }
     if (length(marshaled_summary) > 0) {
       out$marshaled_outputs <- marshaled_summary
+      out$output_object_note <- "Objects listed in metadata$output_names were assigned into the main session at completion."
     }
+    out$metadata <- metadata
+    out$parallel_guidance <- background_parallel_guidance(metadata$output_names)
     return(out)
   }, error = function(e) {
     # callr wraps errors — dig out the original message
     err_msg <- if (!is.null(e$parent)) e$parent$message else e$message
     final_progress <- read_background_progress(job_info$progress_path)
+    metadata <- background_job_metadata(job_id, job_info)
     cleanup_files()
     rm(list = job_id, envir = .claude_bg_jobs)
-    return(list(status = "complete", success = FALSE, error = err_msg, progress = final_progress))
+    return(list(
+      status = "complete",
+      success = FALSE,
+      error = err_msg,
+      progress = final_progress,
+      metadata = metadata,
+      parallel_guidance = background_parallel_guidance(metadata$output_names)
+    ))
   })
 }
 

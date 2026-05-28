@@ -38,6 +38,36 @@ remove_discovery_file <- function(session_name) {
   if (file.exists(f)) file.remove(f)
 }
 
+pid_exists <- function(pid) {
+  # MAJOR WARNING (Windows): never use tools::pskill(pid, signal = 0)
+  # as a liveness probe here. It has been observed to terminate live R
+  # sessions during multi-session startup. This helper must remain read-only.
+  pid_num <- suppressWarnings(as.integer(pid))
+  if (is.na(pid_num) || pid_num <= 0L) return(FALSE)
+
+  if (.Platform$OS.type == "windows") {
+    cmd <- sprintf(
+      "if (Get-Process -Id %d -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }",
+      pid_num
+    )
+    status <- suppressWarnings(system2(
+      "powershell.exe",
+      c("-NoProfile", "-Command", cmd),
+      stdout = FALSE,
+      stderr = FALSE
+    ))
+    return(identical(status, 0L))
+  }
+
+  status <- suppressWarnings(system2(
+    "kill",
+    c("-0", as.character(pid_num)),
+    stdout = FALSE,
+    stderr = FALSE
+  ))
+  identical(status, 0L)
+}
+
 cleanup_stale_discovery_files <- function() {
   d <- discovery_dir()
   if (!dir.exists(d)) return(invisible(NULL))
@@ -45,8 +75,7 @@ cleanup_stale_discovery_files <- function() {
   for (f in files) {
     tryCatch({
       info <- jsonlite::fromJSON(f)
-      # signal = 0 checks if PID exists without killing it
-      pid_alive <- tools::pskill(info$pid, signal = 0)
+      pid_alive <- pid_exists(info$pid)
       if (!isTRUE(pid_alive)) file.remove(f)
     }, error = function(e) {
       # Corrupted file, remove it
@@ -112,6 +141,60 @@ unwrap_viewer <- function() {
 # Package-level environment for non-blocking async execution.
 .claude_bg_jobs <- new.env(parent = emptyenv())
 
+read_background_progress <- function(progress_path) {
+  if (is.null(progress_path) || !file.exists(progress_path)) {
+    return(NULL)
+  }
+
+  tryCatch(readRDS(progress_path), error = function(e) NULL)
+}
+
+write_background_progress <- function(progress_path, stage, message = NULL, percent = NULL) {
+  if (is.null(progress_path)) {
+    return(invisible(NULL))
+  }
+
+  progress <- list(
+    stage = stage,
+    message = message,
+    percent = percent,
+    updated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+  )
+  saveRDS(progress, progress_path)
+  invisible(progress)
+}
+
+background_parallel_guidance <- function(output_names = character(0)) {
+  list(
+    main_session_available = TRUE,
+    safe_parallel_work = "Lightweight read-only commands in the main session are safe while the async job runs.",
+    avoid_parallel_work = paste(
+      "Avoid long synchronous main-session jobs, mutating the same output objects,",
+      "or writing the same files/directories used by the async job."
+    ),
+    output_names = unname(as.character(output_names)),
+    cancel_note = paste(
+      "Cancelling kills the background process and cleans marshaling tempfiles,",
+      "but it does not roll back durable files already written by user code."
+    )
+  )
+}
+
+background_job_metadata <- function(job_id, job_info) {
+  output_names <- if (!is.null(job_info$output_names)) job_info$output_names else character(0)
+  input_names <- if (!is.null(job_info$input_names)) job_info$input_names else character(0)
+  list(
+    job_id = job_id,
+    agent_id = if (!is.null(job_info$agent_id)) job_info$agent_id else "unknown",
+    session_name = if (!is.null(job_info$session_name)) job_info$session_name else NA_character_,
+    session_port = if (!is.null(job_info$session_port)) job_info$session_port else NA_integer_,
+    started_at = if (!is.null(job_info$started)) format(job_info$started, "%Y-%m-%d %H:%M:%S %Z") else NA_character_,
+    input_names = unname(as.character(input_names)),
+    output_names = unname(as.character(output_names)),
+    main_session_available = TRUE
+  )
+}
+
 #' Start a background R job via callr
 #' @param code R code to execute in a separate process
 #' @param job_id Unique identifier for the job
@@ -150,6 +233,8 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
   outputs_path <- if (length(output_names) > 0) {
     tempfile(pattern = paste0("clauder_async_out_", job_id, "_"), fileext = ".rds")
   } else NULL
+  progress_path <- tempfile(pattern = paste0("clauder_async_progress_", job_id, "_"), fileext = ".rds")
+  write_background_progress(progress_path, stage = "submitted", message = "Job accepted")
 
   # Log / print
   if (settings$print_to_console) {
@@ -163,8 +248,20 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
   }
 
   # Launch in a separate R process (skip .Rprofile to avoid startup noise in stderr)
-  job <- callr::r_bg(function(code, inputs_path, outputs_path, output_names) {
+  job <- callr::r_bg(function(code, inputs_path, outputs_path, output_names, progress_path) {
     work_env <- new.env(parent = globalenv())
+
+    work_env$clauder_progress <- function(stage, message = NULL, percent = NULL) {
+      progress <- list(
+        stage = stage,
+        message = message,
+        percent = percent,
+        updated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+      )
+      saveRDS(progress, progress_path)
+      invisible(progress)
+    }
+    work_env$clauder_progress("started", "Background process started")
 
     if (!is.null(inputs_path) && file.exists(inputs_path)) {
       .clauder_inputs <- readRDS(inputs_path)
@@ -183,7 +280,7 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
 
     list(success = TRUE, output = paste(output_lines, collapse = "\n"))
   }, args = list(code = code, inputs_path = inputs_path, outputs_path = outputs_path,
-                 output_names = output_names),
+                 output_names = output_names, progress_path = progress_path),
      supervise = TRUE, user_profile = FALSE)
 
   .claude_bg_jobs[[job_id]] <- list(
@@ -191,9 +288,13 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
     started = Sys.time(),
     code = code,
     agent_id = agent_id,
+    session_name = .claude_server_env$session_name,
+    session_port = .claude_server_env$port,
+    input_names = input_names,
     inputs_path = inputs_path,
     outputs_path = outputs_path,
-    output_names = output_names
+    output_names = output_names,
+    progress_path = progress_path
   )
 
   # Record in history
@@ -206,7 +307,12 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
   )
   .claude_history_env$entries <- c(.claude_history_env$entries, list(history_entry))
 
-  list(success = TRUE, job_id = job_id)
+  list(
+    success = TRUE,
+    job_id = job_id,
+    metadata = background_job_metadata(job_id, .claude_bg_jobs[[job_id]]),
+    parallel_guidance = background_parallel_guidance(output_names)
+  )
 }
 
 #' Kill a running background job
@@ -231,7 +337,10 @@ kill_background_job <- function(job_id) {
   }
 
   # Cleanup marshaling tempfiles regardless of state.
-  for (p in c(job_info$inputs_path, job_info$outputs_path)) {
+  last_progress <- read_background_progress(job_info$progress_path)
+  metadata <- background_job_metadata(job_id, job_info)
+
+  for (p in c(job_info$inputs_path, job_info$outputs_path, job_info$progress_path)) {
     if (!is.null(p) && file.exists(p)) try(file.remove(p), silent = TRUE)
   }
 
@@ -241,7 +350,14 @@ kill_background_job <- function(job_id) {
     status = "cancelled",
     success = TRUE,
     was_alive = was_alive,
-    elapsed_seconds = round(elapsed)
+    elapsed_seconds = round(elapsed),
+    progress = last_progress,
+    metadata = metadata,
+    cleanup_note = paste(
+      "Marshaled input/output/progress tempfiles were cleaned.",
+      "Durable files written by the async code are not rolled back automatically."
+    ),
+    parallel_guidance = background_parallel_guidance(metadata$output_names)
   )
 }
 
@@ -257,12 +373,18 @@ check_background_job <- function(job_id) {
 
   if (job$is_alive()) {
     elapsed <- as.numeric(difftime(Sys.time(), job_info$started, units = "secs"))
-    return(list(status = "running", elapsed_seconds = round(elapsed)))
+    return(list(
+      status = "running",
+      elapsed_seconds = round(elapsed),
+      progress = read_background_progress(job_info$progress_path),
+      metadata = background_job_metadata(job_id, job_info),
+      parallel_guidance = background_parallel_guidance(job_info$output_names)
+    ))
   }
 
   # Best-effort cleanup of marshaling tempfiles regardless of outcome.
   cleanup_files <- function() {
-    for (p in c(job_info$inputs_path, job_info$outputs_path)) {
+    for (p in c(job_info$inputs_path, job_info$outputs_path, job_info$progress_path)) {
       if (!is.null(p) && file.exists(p)) try(file.remove(p), silent = TRUE)
     }
   }
@@ -292,20 +414,37 @@ check_background_job <- function(job_id) {
       }
     }
 
+    final_progress <- read_background_progress(job_info$progress_path)
+    metadata <- background_job_metadata(job_id, job_info)
     cleanup_files()
     rm(list = job_id, envir = .claude_bg_jobs)
 
     out <- c(list(status = "complete"), result)
+    if (!is.null(final_progress)) {
+      out$progress <- final_progress
+    }
     if (length(marshaled_summary) > 0) {
       out$marshaled_outputs <- marshaled_summary
+      out$output_object_note <- "Objects listed in metadata$output_names were assigned into the main session at completion."
     }
+    out$metadata <- metadata
+    out$parallel_guidance <- background_parallel_guidance(metadata$output_names)
     return(out)
   }, error = function(e) {
     # callr wraps errors — dig out the original message
     err_msg <- if (!is.null(e$parent)) e$parent$message else e$message
+    final_progress <- read_background_progress(job_info$progress_path)
+    metadata <- background_job_metadata(job_id, job_info)
     cleanup_files()
     rm(list = job_id, envir = .claude_bg_jobs)
-    return(list(status = "complete", success = FALSE, error = err_msg))
+    return(list(
+      status = "complete",
+      success = FALSE,
+      error = err_msg,
+      progress = final_progress,
+      metadata = metadata,
+      parallel_guidance = background_parallel_guidance(metadata$output_names)
+    ))
   })
 }
 

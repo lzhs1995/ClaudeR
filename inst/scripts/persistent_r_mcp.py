@@ -217,6 +217,43 @@ async def post_to_r_addin(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": False, "error": f"Error communicating with RStudio: {str(e)}"}
 
 
+def format_async_metadata(result: Dict[str, Any], include_guidance: bool = True) -> str:
+    """Render async job metadata and parallel-use guidance returned by R."""
+    metadata = result.get("metadata") or {}
+    guidance = result.get("parallel_guidance") or {}
+    lines: List[str] = []
+
+    if metadata:
+        fields = []
+        for key in ("job_id", "agent_id", "session_name", "session_port", "started_at"):
+            value = metadata.get(key)
+            if value not in (None, "", []):
+                fields.append(f"{key}={value}")
+        for key in ("input_names", "output_names"):
+            values = metadata.get(key)
+            if values:
+                if isinstance(values, list):
+                    values = ", ".join(str(v) for v in values)
+                fields.append(f"{key}=[{values}]")
+        if metadata.get("main_session_available") is True:
+            fields.append("main_session_available=true")
+        if fields:
+            lines.append("Async metadata: " + "; ".join(fields) + ".")
+
+    if include_guidance and guidance:
+        safe = guidance.get("safe_parallel_work")
+        avoid = guidance.get("avoid_parallel_work")
+        cancel = guidance.get("cancel_note")
+        if safe:
+            lines.append("Parallel guidance: " + safe)
+        if avoid:
+            lines.append("Parallel caution: " + avoid)
+        if cancel:
+            lines.append("Cancel caution: " + cancel)
+
+    return "\n".join(lines)
+
+
 # Check if the R addin is running and return status info
 async def check_addin_status(return_info: bool = False):
     """Check if the RStudio addin is running.
@@ -803,7 +840,7 @@ async def list_tools() -> List[types.Tool]:
                 "1. Auto-marshaled (recommended). Pass `inputs` (object names from the main session to copy into the background) and `outputs` (object names the background code creates that should be loaded back into the main session). The tool handles all saveRDS/readRDS plumbing. Inputs are snapshotted at submit time, so changes in the main session after submit do not affect the running job. Outputs are auto-loaded into the main session when get_async_result returns complete.\n"
                 "2. Manual. Omit `inputs` and `outputs` and write self-contained code that uses saveRDS()/readRDS() to pass data in and out yourself. Backwards-compatible with existing patterns.\n\n"
                 "The background process never has access to the main session's environment except via the marshaled `inputs`. Connection objects (DB connections, open file handles) cannot be marshaled. The background process must `library()` any packages it needs.\n\n"
-                "You can continue executing other code with execute_r while the job runs. Use get_async_result to check status when ready."
+                "You can continue executing lightweight code with execute_r while the job runs. Avoid long synchronous main-session work, mutating objects named in `outputs`, or writing files/directories used by the async job. Use get_async_result to check status when ready."
             ),
             inputSchema={
                 "type": "object",
@@ -859,7 +896,8 @@ async def list_tools() -> List[types.Tool]:
                 "brief grace period) to the background R process and cleans up any marshaled "
                 "input/output tempfiles. Use this when an async job is hung, taking far longer "
                 "than expected, or you realized the code has a bug. Safe to call on jobs that "
-                "have already finished — returns 'not_found' in that case."
+                "have already finished — returns 'not_found' in that case. Cancelling does not "
+                "roll back durable files already written by user code."
             ),
             inputSchema={
                 "type": "object",
@@ -1618,13 +1656,17 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
             marshaling_note += f" Inputs marshaled from main session: {', '.join(inputs)}."
         if outputs:
             marshaling_note += f" Outputs ({', '.join(outputs)}) will auto-load into the main session when the job completes."
+        metadata_note = format_async_metadata(result)
+        if metadata_note:
+            metadata_note = "\n" + metadata_note
 
         return [types.TextContent(
             type="text",
             text=(
                 f"Job {job_id} started in a background R process.{marshaling_note} "
-                f"The main R session remains available — you can continue running other code with execute_r while this job runs. "
+                f"The main R session remains available — you can continue lightweight execute_r work while this job runs. "
                 f"Use get_async_result(\"{job_id}\") to check status when ready."
+                f"{metadata_note}"
             )
         )]
 
@@ -1647,9 +1689,30 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
 
         if status == "running":
             elapsed = result.get("elapsed_seconds", "?")
+            progress = result.get("progress") or {}
+            progress_text = ""
+            stage = progress.get("stage")
+            message = progress.get("message")
+            percent = progress.get("percent")
+            updated_at = progress.get("updated_at")
+            if stage:
+                progress_bits = [f"stage={stage}"]
+                if percent is not None:
+                    progress_bits.append(f"percent={percent}")
+                if message:
+                    progress_bits.append(f"message={message}")
+                if updated_at:
+                    progress_bits.append(f"updated_at={updated_at}")
+                progress_text = " Latest progress: " + "; ".join(progress_bits) + "."
+            metadata_text = format_async_metadata(result, include_guidance=False)
+            if metadata_text:
+                metadata_text = " " + metadata_text
             return [types.TextContent(
                 type="text",
-                text=f"Job {job_id} is still running ({elapsed}s elapsed). Call get_async_result(\"{job_id}\") again to check."
+                text=(
+                    f"Job {job_id} is still running ({elapsed}s elapsed)."
+                    f"{progress_text}{metadata_text} Call get_async_result(\"{job_id}\") again to check."
+                )
             )]
 
         # Job is complete
@@ -1673,6 +1736,31 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
             result_contents.append(types.TextContent(
                 type="text",
                 text="--- Outputs loaded into main session ---\n" + "\n".join(marshaled)
+            ))
+
+        progress = result.get("progress") or {}
+        stage = progress.get("stage")
+        if stage:
+            progress_bits = [f"stage={stage}"]
+            percent = progress.get("percent")
+            message = progress.get("message")
+            updated_at = progress.get("updated_at")
+            if percent is not None:
+                progress_bits.append(f"percent={percent}")
+            if message:
+                progress_bits.append(f"message={message}")
+            if updated_at:
+                progress_bits.append(f"updated_at={updated_at}")
+            result_contents.append(types.TextContent(
+                type="text",
+                text="--- Final progress ---\n" + "; ".join(progress_bits)
+            ))
+
+        metadata_text = format_async_metadata(result)
+        if metadata_text:
+            result_contents.append(types.TextContent(
+                type="text",
+                text="--- Async metadata and parallel guidance ---\n" + metadata_text
             ))
 
         return result_contents or [types.TextContent(
@@ -1701,6 +1789,12 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
                 msg = f"Cancelled job {job_id} after {elapsed}s. Background process killed and tempfiles cleaned up."
             else:
                 msg = f"Job {job_id} had already finished but had not been collected (it ran for {elapsed}s). Cleaned up tempfiles and removed it."
+            cleanup_note = result.get("cleanup_note")
+            if cleanup_note:
+                msg += f" {cleanup_note}"
+            metadata_text = format_async_metadata(result)
+            if metadata_text:
+                msg += "\n" + metadata_text
             return [types.TextContent(type="text", text=msg)]
 
         return [types.TextContent(

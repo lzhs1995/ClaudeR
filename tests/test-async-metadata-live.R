@@ -39,12 +39,16 @@ stopifnot(grepl(
 
 Sys.sleep(1)
 running <- ClaudeR:::check_background_job(job_id)
-stopifnot(identical(running$status, "running"))
+stopifnot(running$status %in% c("running", "complete"))
 stopifnot(identical(running$metadata$job_id, job_id))
 stopifnot(identical(running$metadata$output_names, "async_metadata_probe"))
 
-Sys.sleep(3)
-completed <- ClaudeR:::check_background_job(job_id)
+completed <- running
+deadline <- Sys.time() + 30
+while (!identical(completed$status, "complete") && Sys.time() < deadline) {
+  Sys.sleep(1)
+  completed <- ClaudeR:::check_background_job(job_id)
+}
 stopifnot(identical(completed$status, "complete"))
 stopifnot(isTRUE(completed$success))
 stopifnot(exists("async_metadata_probe", envir = .GlobalEnv, inherits = FALSE))

@@ -41,6 +41,41 @@ claudeAddin()
 
 > **AI agents:** See [llms-install.md](llms-install.md) for automated setup instructions.
 
+## LZHS patched fork release
+
+This fork publishes an opt-in release for users who need Codex/Copilot-facing async progress text, async job metadata, and the Windows multi-session safety patch before those changes are merged upstream.
+
+Install the pinned fork release:
+
+```r
+if (!require("devtools")) install.packages("devtools")
+devtools::install_github("lzhs1995/ClaudeR@v0.2.0-lzhs.1")
+```
+
+Configure Codex to run the MCP bridge from the same pinned fork release:
+
+```r
+library(ClaudeR)
+install_cli(
+  tools = "codex",
+  mcp_from = "git",
+  mcp_repo = "https://github.com/lzhs1995/ClaudeR.git",
+  mcp_ref = "v0.2.0-lzhs.1"
+)
+```
+
+If your environment cannot run `uvx` directly from a Git subdirectory, clone this repository locally and use:
+
+```r
+install_cli(
+  tools = "codex",
+  mcp_from = "local",
+  mcp_local_path = "C:/Users/<USER>/projects/ClaudeR"
+)
+```
+
+The default `install_cli()` behavior still uses `uvx clauder-mcp` from the published package. Use `mcp_from = "git"` or `mcp_from = "local"` when you specifically need this fork's patched bridge.
+
 <details>
 <summary><b>Recent Updates</b> (click to expand)</summary>
 

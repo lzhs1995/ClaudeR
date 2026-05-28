@@ -16,6 +16,14 @@
 #'   and pointing to the bundled script.
 #' @param python_path Optional. Only used when `use_uvx = FALSE`. A character
 #'   string specifying the absolute path to the Python executable.
+#' @param mcp_from Character. Only used when `use_uvx = TRUE`. One of `"pypi"`,
+#'   `"git"`, or `"local"`. `"pypi"` preserves the default `uvx clauder-mcp`
+#'   behavior. `"git"` runs the MCP bridge from `mcp_repo` at `mcp_ref`.
+#'   `"local"` runs the MCP bridge from a local ClaudeR checkout.
+#' @param mcp_repo Git repository URL used when `mcp_from = "git"`.
+#' @param mcp_ref Git ref, branch, or tag used when `mcp_from = "git"`.
+#' @param mcp_local_path Local ClaudeR checkout or `clauder-mcp` directory used
+#'   when `mcp_from = "local"`.
 #' @param ... Additional arguments passed to `install.packages` for any
 #'   missing R dependencies.
 #' @details This function will:
@@ -23,7 +31,14 @@
 #'   2. Provide you with the exact command to run (for Claude/Codex/Copilot/Qwen)
 #'      or the exact JSON to copy (for Gemini/Copilot) to complete the setup.
 #' @export
-install_cli <- function(tools = "claude", use_uvx = TRUE, python_path = NULL, ...) {
+install_cli <- function(tools = "claude",
+                        use_uvx = TRUE,
+                        python_path = NULL,
+                        mcp_from = c("pypi", "git", "local"),
+                        mcp_repo = "https://github.com/lzhs1995/ClaudeR.git",
+                        mcp_ref = "v0.2.0-lzhs.1",
+                        mcp_local_path = NULL,
+                        ...) {
   # --- 1. Parameter Validation ---
   cli_choices <- c("claude", "codex", "copilot", "qwen", "gemini")
   tools <- try(match.arg(tools, choices = cli_choices, several.ok = TRUE), silent = TRUE)
@@ -43,13 +58,57 @@ install_cli <- function(tools = "claude", use_uvx = TRUE, python_path = NULL, ..
     message("All required R dependencies are already installed.")
   }
 
+  quote_arg <- function(x) {
+    shQuote(x, type = if (.Platform$OS.type == "windows") "cmd" else "sh")
+  }
+
+  shell_args <- function(args) {
+    paste(vapply(args, quote_arg, character(1)), collapse = " ")
+  }
+
+  toml_array <- function(args) {
+    esc <- gsub("\\\\", "\\\\\\\\", args)
+    esc <- gsub('"', '\\"', esc, fixed = TRUE)
+    paste0('["', paste(esc, collapse = '", "'), '"]')
+  }
+
+  as_json_args <- function(args) {
+    as.list(unname(args))
+  }
+
   # --- 3. Resolve the MCP server command ---
   if (use_uvx) {
+    mcp_from <- match.arg(mcp_from)
     message("\n--- Step 2: Using uvx (recommended) ---")
-    message("The 'clauder-mcp' PyPI package handles all Python dependencies automatically.")
     mcp_command <- "uvx"
-    mcp_args <- "clauder-mcp"
+    if (mcp_from == "pypi") {
+      message("The 'clauder-mcp' PyPI package handles all Python dependencies automatically.")
+      mcp_args <- "clauder-mcp"
+    } else if (mcp_from == "git") {
+      if (!nzchar(mcp_repo) || !nzchar(mcp_ref)) {
+        stop("'mcp_repo' and 'mcp_ref' must be non-empty when mcp_from = 'git'.", call. = FALSE)
+      }
+      message(paste("Using clauder-mcp from Git ref:", mcp_ref))
+      mcp_args <- c("--from", paste0("git+", mcp_repo, "@", mcp_ref, "#subdirectory=clauder-mcp"), "clauder-mcp")
+    } else {
+      if (is.null(mcp_local_path) || !nzchar(mcp_local_path)) {
+        stop("'mcp_local_path' is required when mcp_from = 'local'.", call. = FALSE)
+      }
+      local_path <- path.expand(mcp_local_path)
+      if (basename(normalizePath(local_path, winslash = "/", mustWork = FALSE)) != "clauder-mcp") {
+        local_path <- file.path(local_path, "clauder-mcp")
+      }
+      if (!file.exists(file.path(local_path, "pyproject.toml"))) {
+        stop(paste("Could not find clauder-mcp/pyproject.toml under:", local_path), call. = FALSE)
+      }
+      message(paste("Using local clauder-mcp source:", local_path))
+      mcp_args <- c("--from", normalizePath(local_path, winslash = "\\", mustWork = TRUE), "clauder-mcp")
+    }
   } else {
+    mcp_from <- match.arg(mcp_from)
+    if (mcp_from != "pypi") {
+      stop("Set use_uvx = TRUE when using mcp_from = 'git' or mcp_from = 'local'.", call. = FALSE)
+    }
     message("\n--- Step 2: Locating Python executable (legacy mode) ---")
     final_python_path <- python_path
 
@@ -100,12 +159,16 @@ install_cli <- function(tools = "claude", use_uvx = TRUE, python_path = NULL, ..
     if (tool == "claude") {
       remove_string <- 'claude mcp remove r-studio -s user 2>/dev/null'
       if (use_uvx) {
-        add_string <- 'claude mcp add --transport stdio --scope user r-studio -- uvx clauder-mcp'
+        add_string <- paste(
+          'claude mcp add --transport stdio --scope user r-studio --',
+          quote_arg(mcp_command),
+          shell_args(mcp_args)
+        )
       } else {
         add_string <- sprintf(
           'claude mcp add --transport stdio --scope user r-studio -- %s %s',
-          shQuote(mcp_command, type = "cmd"),
-          shQuote(mcp_args, type = "cmd")
+          quote_arg(mcp_command),
+          shell_args(mcp_args)
         )
       }
       cat("\n--- For Claude Code CLI ---\n")
@@ -116,24 +179,27 @@ install_cli <- function(tools = "claude", use_uvx = TRUE, python_path = NULL, ..
     if (tool == "codex") {
       remove_string <- 'codex mcp remove r-studio 2>/dev/null'
       if (use_uvx) {
-        add_string <- 'codex mcp add r-studio -- uvx clauder-mcp'
+        add_string <- paste(
+          'codex mcp add r-studio --',
+          quote_arg(mcp_command),
+          shell_args(mcp_args)
+        )
         toml_block <- paste(
           '[mcp_servers.r-studio]',
           'command = "uvx"',
-          'args = ["clauder-mcp"]',
+          sprintf('args = %s', toml_array(mcp_args)),
           sep = "\n"
         )
       } else {
         add_string <- sprintf(
           'codex mcp add r-studio -- %s %s',
-          shQuote(mcp_command, type = "cmd"),
-          shQuote(mcp_args, type = "cmd")
+          quote_arg(mcp_command),
+          shell_args(mcp_args)
         )
-        toml_args <- paste0('["', mcp_args, '"]')
         toml_block <- paste(
           '[mcp_servers.r-studio]',
           sprintf('command = "%s"', mcp_command),
-          sprintf('args = %s', toml_args),
+          sprintf('args = %s', toml_array(mcp_args)),
           sep = "\n"
         )
       }
@@ -173,25 +239,27 @@ install_cli <- function(tools = "claude", use_uvx = TRUE, python_path = NULL, ..
         add_string <- paste(c(
           "copilot mcp add r-studio --transport stdio --tools \"*\"",
           copilot_env_flags,
-          "-- uvx clauder-mcp"
+          "--",
+          quote_arg(mcp_command),
+          shell_args(mcp_args)
         ), collapse = " ")
         copilot_server <- list(
           type = "local",
           command = "uvx",
-          args = list("clauder-mcp")
+          args = as_json_args(mcp_args)
         )
       } else {
         add_string <- paste(c(
           "copilot mcp add r-studio --transport stdio --tools \"*\"",
           copilot_env_flags,
           "--",
-          shQuote(mcp_command, type = "cmd"),
-          shQuote(mcp_args, type = "cmd")
+          quote_arg(mcp_command),
+          shell_args(mcp_args)
         ), collapse = " ")
         copilot_server <- list(
           type = "local",
           command = mcp_command,
-          args = list(mcp_args)
+          args = as_json_args(mcp_args)
         )
       }
       if (length(copilot_env) > 0) {
@@ -217,12 +285,16 @@ install_cli <- function(tools = "claude", use_uvx = TRUE, python_path = NULL, ..
     if (tool == "qwen") {
       remove_string <- 'qwen mcp remove --scope user r-studio 2>/dev/null'
       if (use_uvx) {
-        add_string <- 'qwen mcp add --scope user --transport stdio r-studio uvx clauder-mcp'
+        add_string <- paste(
+          'qwen mcp add --scope user --transport stdio r-studio',
+          quote_arg(mcp_command),
+          shell_args(mcp_args)
+        )
       } else {
         add_string <- sprintf(
           'qwen mcp add --scope user --transport stdio r-studio %s %s',
-          shQuote(mcp_command, type = "cmd"),
-          shQuote(mcp_args, type = "cmd")
+          quote_arg(mcp_command),
+          shell_args(mcp_args)
         )
       }
       cat("\n--- For Qwen Code CLI ---\n")
@@ -236,7 +308,7 @@ install_cli <- function(tools = "claude", use_uvx = TRUE, python_path = NULL, ..
           mcpServers = list(
             `r-studio` = list(
               command = "uvx",
-              args = list("clauder-mcp")
+              args = as_json_args(mcp_args)
             )
           )
         )
@@ -245,7 +317,7 @@ install_cli <- function(tools = "claude", use_uvx = TRUE, python_path = NULL, ..
           mcpServers = list(
             `r-studio` = list(
               command = mcp_command,
-              args = list(mcp_args),
+              args = as_json_args(mcp_args),
               env = list(PYTHONUNBUFFERED = "1")
             )
           )

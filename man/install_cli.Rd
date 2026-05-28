@@ -4,7 +4,16 @@
 \alias{install_cli}
 \title{Install and Set Up ClaudeR for CLI Tools}
 \usage{
-install_cli(tools = "claude", use_uvx = TRUE, python_path = NULL, ...)
+install_cli(
+  tools = "claude",
+  use_uvx = TRUE,
+  python_path = NULL,
+  mcp_from = c("pypi", "git", "local"),
+  mcp_repo = "https://github.com/lzhs1995/ClaudeR.git",
+  mcp_ref = "v0.2.0-lzhs.1",
+  mcp_local_path = NULL,
+  ...
+)
 }
 \arguments{
 \item{tools}{A character vector specifying which CLI tools to configure.
@@ -18,6 +27,18 @@ and pointing to the bundled script.}
 
 \item{python_path}{Optional. A character string specifying the absolute path
 to the Python executable to use. Only used when `use_uvx = FALSE`.}
+
+\item{mcp_from}{Character. Only used when `use_uvx = TRUE`. One of `"pypi"`,
+`"git"`, or `"local"`. `"pypi"` preserves the default `uvx clauder-mcp`
+behavior. `"git"` runs the MCP bridge from `mcp_repo` at `mcp_ref`.
+`"local"` runs the MCP bridge from a local ClaudeR checkout.}
+
+\item{mcp_repo}{Git repository URL used when `mcp_from = "git"`.}
+
+\item{mcp_ref}{Git ref, branch, or tag used when `mcp_from = "git"`.}
+
+\item{mcp_local_path}{Local ClaudeR checkout or `clauder-mcp` directory used
+when `mcp_from = "local"`.}
 
 \item{...}{Additional arguments passed to `install.packages` for any
 missing R dependencies.}

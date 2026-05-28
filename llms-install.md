@@ -20,6 +20,12 @@ if (!require("devtools")) install.packages("devtools")
 devtools::install_github("IMNMV/ClaudeR")
 ```
 
+For the LZHS patched fork release with Codex/Copilot async progress and Windows multi-session safety:
+
+```r
+devtools::install_github("lzhs1995/ClaudeR@v0.2.0-lzhs.1")
+```
+
 ### Step 2: Run the Setup Function for Your AI Tool
 
 Ask the user which CLI agent they want to install for (Claude Code, Codex, GitHub Copilot CLI, Qwen Code, or Gemini), then run the matching command:
@@ -34,6 +40,17 @@ install_cli(tools = "claude")
 ```R
 library(ClaudeR)
 install_cli(tools = "codex")
+```
+
+To pin Codex to the LZHS patched MCP bridge instead of the default published `clauder-mcp` package:
+
+```r
+install_cli(
+  tools = "codex",
+  mcp_from = "git",
+  mcp_repo = "https://github.com/lzhs1995/ClaudeR.git",
+  mcp_ref = "v0.2.0-lzhs.1"
+)
 ```
 
 **For GitHub Copilot CLI:**

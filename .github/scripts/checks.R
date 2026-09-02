@@ -26,6 +26,7 @@ sys.source("R/coordination.R", envir = env)
 sys.source("R/screening.R", envir = env)
 sys.source("R/grantpanel.R", envir = env)
 sys.source("R/response.R", envir = env)
+sys.source("R/install_cli.r", envir = env)
 
 # --- 2. Lab-mode assembly gates ---
 lab <- tempfile("labtest"); dir.create(lab)
@@ -151,6 +152,57 @@ r <- tryCatch({
     any(grepl("jsonlite (", md, fixed = TRUE))
 }, error = function(e) conditionMessage(e))
 if (isTRUE(r)) pass("codebook generator") else fail("codebook:", r)
+
+r <- tryCatch({
+  proj <- tempfile("proj-nested-write"); dir.create(proj)
+  utils::write.csv(data.frame(group = c(0, 1), outcome = c(1, 2)),
+                   file.path(proj, "d.csv"), row.names = FALSE)
+  writeLines(c(
+    "d <- read.csv(\"d.csv\")",
+    "model <- lm(outcome ~ group, data = d)",
+    "write.csv(coef(summary(model)), \"model_summary.csv\")"
+  ), file.path(proj, "analysis.R"))
+  out <- suppressMessages(env$generate_codebook(proj))
+  any(grepl("model_summary.csv", readLines(out), fixed = TRUE))
+}, error = function(e) conditionMessage(e))
+if (isTRUE(r)) pass("codebook detects nested write.csv output") else
+  fail("codebook nested write.csv:", r)
+
+r <- tryCatch({
+  proj <- tempfile("proj-writer-matrix"); dir.create(proj)
+  writeLines(c(
+    "x <- data.frame(a = 1)",
+    "saveRDS(x, file.path(\"outputs\", \"x.rds\"))",
+    "writeLines(\"ok\", con = \"run.log\")",
+    "write.table(x, paste0(\"table\", \".tsv\"))",
+    "ggplot2::ggsave(filename = \"figure.png\", plot = NULL)",
+    "readr::write_csv(x, \"tidy.csv\")",
+    "readr::write_rds(x, file = \"tidy.rds\")",
+    "save(x, file = \"workspace.RData\")"
+  ), file.path(proj, "writers.R"))
+  out <- suppressMessages(env$generate_codebook(proj))
+  md <- paste(readLines(out), collapse = "\n")
+  expected <- c("outputs/x.rds", "run.log", "table.tsv", "figure.png",
+                "tidy.csv", "tidy.rds", "workspace.RData")
+  all(vapply(expected, grepl, logical(1), x = md, fixed = TRUE))
+}, error = function(e) conditionMessage(e))
+if (isTRUE(r)) pass("codebook detects supported writer matrix") else
+  fail("codebook writer matrix:", r)
+
+r <- tryCatch({
+  proj <- tempfile("proj-qmd-write"); dir.create(proj)
+  writeLines(c(
+    "---", "title: Codebook fixture", "---", "",
+    "```{r model-output}",
+    "fit <- list(coef = 1)",
+    "saveRDS(fit, file = \"model_from_qmd.rds\")",
+    "```"
+  ), file.path(proj, "analysis.qmd"))
+  out <- suppressMessages(env$generate_codebook(proj))
+  any(grepl("model_from_qmd.rds", readLines(out), fixed = TRUE))
+}, error = function(e) conditionMessage(e))
+if (isTRUE(r)) pass("codebook detects outputs in Quarto R chunks") else
+  fail("codebook Quarto output:", r)
 
 # --- 8. manuscript write-back (needs xml2 + zip) ---
 if (requireNamespace("xml2", quietly = TRUE) && requireNamespace("zip", quietly = TRUE)) {
@@ -500,6 +552,51 @@ r <- tryCatch({
   length(disk) == 4 && any(grepl("b2 <- 22", disk, fixed = TRUE))
 }, error = function(e) conditionMessage(e))
 if (isTRUE(r)) pass("editor: line-count-changing splice persists to disk") else fail("editor splice:", r)
+
+# --- 17. async progress sidecar and metadata ---
+if (requireNamespace("callr", quietly = TRUE)) {
+  r <- tryCatch({
+    server_env <- get(".claude_server_env", envir = env)
+    server_env$session_name <- "checks"
+    server_env$port <- 8788L
+    job_id <- paste0("check-", Sys.getpid())
+    started <- env$start_background_job(
+      paste(
+        "clauder_progress('fit', 'group 1', 50)",
+        "Sys.sleep(0.2)",
+        "clauder_progress('complete', 'done', 100)",
+        sep = "; "
+      ),
+      job_id,
+      settings = list(print_to_console = FALSE, log_to_file = FALSE),
+      agent_id = "checks-agent"
+    )
+    result <- NULL
+    for (i in seq_len(50L)) {
+      result <- env$check_background_job(job_id)
+      if (identical(result$status, "complete")) break
+      Sys.sleep(0.05)
+    }
+    isTRUE(started$success) && identical(started$metadata$job_id, job_id) &&
+      identical(started$metadata$session_name, "checks") &&
+      identical(result$status, "complete") &&
+      identical(result$progress$stage, "complete") &&
+      identical(result$progress$percent, 100)
+  }, error = function(e) conditionMessage(e))
+  if (isTRUE(r)) pass("async progress sidecar and metadata") else
+    fail("async progress:", r)
+}
+
+# --- 18. Copilot CLI configuration is cross-platform ---
+r <- tryCatch({
+  txt <- paste(capture.output(env$install_cli(tools = "copilot", use_uvx = TRUE)),
+               collapse = "\n")
+  grepl("copilot mcp add r-studio", txt, fixed = TRUE) &&
+    grepl("mcp-config.json", txt, fixed = TRUE) &&
+    grepl("NO_PROXY", txt, fixed = TRUE)
+}, error = function(e) conditionMessage(e))
+if (isTRUE(r)) pass("install_cli: Copilot configuration") else
+  fail("install_cli Copilot:", r)
 
 if (!ok) quit(status = 1)
 cat("\nAll checks passed.\n")

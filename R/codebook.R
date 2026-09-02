@@ -55,6 +55,119 @@ read_data_file <- function(path) {
   }, error = function(e) NULL)
 }
 
+# Return the unqualified function name for ordinary and namespace-qualified
+# calls (for example `write.csv(...)` and `utils::write.csv(...)`).
+codebook_call_name <- function(x) {
+  if (!is.call(x) || length(x) == 0L) return(NA_character_)
+  head <- x[[1L]]
+  if (is.symbol(head)) return(as.character(head))
+  if (is.call(head) && length(head) == 3L &&
+      identical(as.character(head[[1L]]), "::")) {
+    return(as.character(head[[3L]]))
+  }
+  NA_character_
+}
+
+# Resolve only static paths. Dynamic output paths cannot be listed reliably
+# without executing the script, so they remain for manual review.
+codebook_static_path <- function(x) {
+  if (is.character(x) && length(x) == 1L && !is.na(x)) return(x)
+  if (!is.call(x)) return(NULL)
+
+  name <- codebook_call_name(x)
+  args <- as.list(x)[-1L]
+  arg_names <- names(args)
+  if (is.null(arg_names)) arg_names <- rep("", length(args))
+  positional <- args[arg_names == ""]
+
+  if (identical(name, "file.path") && length(positional) > 0L) {
+    parts <- lapply(positional, codebook_static_path)
+    if (all(vapply(parts, function(z) length(z) == 1L, logical(1)))) {
+      return(do.call(file.path, parts))
+    }
+  }
+  if (name %in% c("paste", "paste0") && length(positional) > 0L) {
+    parts <- lapply(positional, codebook_static_path)
+    if (all(vapply(parts, function(z) length(z) == 1L, logical(1)))) {
+      sep <- if (identical(name, "paste0")) "" else " "
+      if ("sep" %in% arg_names) {
+        parsed_sep <- codebook_static_path(args[[which(arg_names == "sep")[[1L]]]])
+        if (length(parsed_sep) != 1L) return(NULL)
+        sep <- parsed_sep
+      }
+      return(paste(unlist(parts, use.names = FALSE), collapse = sep))
+    }
+  }
+  NULL
+}
+
+codebook_output_path <- function(call) {
+  name <- codebook_call_name(call)
+  specs <- list(
+    write.csv = list(named = "file", position = 2L),
+    write_csv = list(named = "file", position = 2L),
+    saveRDS = list(named = "file", position = 2L),
+    write_rds = list(named = "file", position = 2L),
+    writeLines = list(named = "con", position = 2L),
+    write.table = list(named = "file", position = 2L),
+    ggsave = list(named = "filename", position = 1L),
+    save = list(named = "file", position = NA_integer_)
+  )
+  spec <- specs[[name]]
+  if (is.null(spec)) return(NULL)
+
+  args <- as.list(call)[-1L]
+  arg_names <- names(args)
+  if (is.null(arg_names)) arg_names <- rep("", length(args))
+  named_index <- which(arg_names == spec$named)
+  if (length(named_index) > 0L) {
+    return(codebook_static_path(args[[named_index[[1L]]]]))
+  }
+  if (!is.na(spec$position) && length(args) >= spec$position) {
+    return(codebook_static_path(args[[spec$position]]))
+  }
+  NULL
+}
+
+codebook_collect_output_paths <- function(exprs) {
+  paths <- character(0)
+  visit <- function(x) {
+    if (is.expression(x) || is.pairlist(x)) {
+      for (child in as.list(x)) visit(child)
+      return(invisible(NULL))
+    }
+    if (!is.call(x)) return(invisible(NULL))
+    path <- codebook_output_path(x)
+    if (length(path) == 1L && nzchar(path)) paths <<- c(paths, path)
+    for (child in as.list(x)[-1L]) visit(child)
+    invisible(NULL)
+  }
+  visit(exprs)
+  unique(paths)
+}
+
+codebook_parse_script <- function(path, source_lines) {
+  ext <- tolower(tools::file_ext(path))
+  if (identical(ext, "r")) {
+    return(tryCatch(parse(text = source_lines, keep.source = FALSE),
+                    error = function(e) expression()))
+  }
+
+  in_chunk <- FALSE
+  code <- character(0)
+  for (line in source_lines) {
+    if (!in_chunk && grepl("^\\s*```\\{[rR](?:[ ,}].*)?$", line, perl = TRUE)) {
+      in_chunk <- TRUE
+    } else if (in_chunk && grepl("^\\s*```\\s*$", line, perl = TRUE)) {
+      in_chunk <- FALSE
+    } else if (in_chunk) {
+      code <- c(code, line)
+    }
+  }
+  tryCatch(parse(text = code, keep.source = FALSE),
+           error = function(e) expression())
+}
+
 #' Generate a codebook and reproducibility README for a project
 #'
 #' Scans the project's scripts (.R, .Rmd, .qmd) for `library()`/`require()`
@@ -87,7 +200,6 @@ generate_codebook <- function(project_dir = ".", data_files = NULL,
   reads <- character(0)
   writes <- character(0)
   read_pattern <- "(read\\.csv|read_csv|read\\.delim|read_tsv|readRDS|read_rds|load|read_excel|read_xlsx|fread|read_sav|read_dta)\\s*\\(\\s*['\"]([^'\"]+)['\"]"
-  write_pattern <- "(write\\.csv|write_csv|saveRDS|write_rds|ggsave|save|writeLines|write\\.table)\\s*\\(\\s*(?:[^,)]*,\\s*)?(?:file(?:name)?\\s*=\\s*)?['\"]([^'\"]+)['\"]"
 
   for (s in scripts) {
     src <- tryCatch(readLines(s, warn = FALSE), error = function(e) character(0))
@@ -100,9 +212,7 @@ generate_codebook <- function(project_dir = ".", data_files = NULL,
     for (m in regmatches(txt, gregexpr(read_pattern, txt, perl = TRUE))[[1]]) {
       reads <- c(reads, sub(read_pattern, "\\2", m, perl = TRUE))
     }
-    for (m in regmatches(txt, gregexpr(write_pattern, txt, perl = TRUE))[[1]]) {
-      writes <- c(writes, sub(write_pattern, "\\2", m, perl = TRUE))
-    }
+    writes <- c(writes, codebook_collect_output_paths(codebook_parse_script(s, src)))
   }
   pkgs <- sort(unique(pkgs))
   reads <- unique(reads)

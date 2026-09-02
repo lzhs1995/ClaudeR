@@ -8,10 +8,50 @@ import pytest
 
 from clauder_mcp.server import (
     escape_r_string,
+    format_async_metadata,
+    format_async_progress,
     _extract_json,
     _parse_annotation_schema,
     _validate_annotation,
 )
+
+
+class TestAsyncRendering:
+    def test_metadata_and_guidance(self):
+        rendered = format_async_metadata({
+            "metadata": {
+                "job_id": "job-1",
+                "agent_id": "codex",
+                "session_name": "default",
+                "output_names": ["result"],
+                "main_session_available": True,
+            },
+            "parallel_guidance": {
+                "safe_parallel_work": "Read-only checks are safe.",
+                "avoid_parallel_work": "Do not mutate outputs.",
+                "cancel_note": "Durable files remain.",
+            },
+        })
+        assert "job_id=job-1" in rendered
+        assert "output_names=[result]" in rendered
+        assert "main_session_available=true" in rendered
+        assert "Parallel guidance" in rendered
+        assert "Durable files remain" in rendered
+
+    def test_can_omit_guidance(self):
+        rendered = format_async_metadata({
+            "metadata": {"job_id": "job-2"},
+            "parallel_guidance": {"safe_parallel_work": "safe"},
+        }, include_guidance=False)
+        assert "job_id=job-2" in rendered
+        assert "Parallel guidance" not in rendered
+
+    def test_progress_omits_empty_json_sentinels(self):
+        assert format_async_progress({"stage": "fit", "percent": {}}) == "stage=fit"
+        assert format_async_progress({"stage": "fit", "percent": 25, "message": "group 2"}) == (
+            "stage=fit; percent=25; message=group 2"
+        )
+        assert format_async_progress(None) == ""
 
 
 # --- escape_r_string ---------------------------------------------------

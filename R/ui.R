@@ -292,6 +292,120 @@ write_background_progress <- function(progress_path, stage, message = NULL,
   invisible(progress)
 }
 
+async_output_limit <- function() {
+  configured <- suppressWarnings(as.numeric(Sys.getenv(
+    "CLAUDER_ASYNC_OUTPUT_MAX_BYTES", unset = "1048576"
+  )))
+  if (!is.finite(configured) || configured < 1024) configured <- 1048576
+  as.integer(min(configured, .Machine$integer.max))
+}
+
+background_job_files <- function(job_info) {
+  unname(Filter(
+    function(path) !is.null(path) && length(path) == 1L && nzchar(path),
+    list(
+      job_info$inputs_path,
+      job_info$outputs_path,
+      job_info$progress_path,
+      job_info$capture_path,
+      job_info$stdout_path,
+      job_info$stderr_path
+    )
+  ))
+}
+
+cleanup_background_files <- function(job_info) {
+  for (path in background_job_files(job_info)) {
+    if (file.exists(path)) try(file.remove(path), silent = TRUE)
+  }
+  invisible(NULL)
+}
+
+read_background_text <- function(path, max_bytes = async_output_limit()) {
+  if (is.null(path) || !file.exists(path)) {
+    return(list(text = "", bytes = 0, truncated = FALSE))
+  }
+  size <- suppressWarnings(as.numeric(file.info(path)$size[[1]]))
+  if (!is.finite(size) || size <= 0) {
+    return(list(text = "", bytes = max(0, size), truncated = FALSE))
+  }
+  keep <- min(size, max_bytes)
+  connection <- file(path, open = "rb")
+  on.exit(close(connection), add = TRUE)
+  if (size > keep) seek(connection, where = size - keep, origin = "start")
+  bytes <- readBin(connection, what = "raw", n = keep)
+  text <- if (length(bytes)) rawToChar(bytes) else ""
+  text <- iconv(text, from = "", to = "UTF-8", sub = "byte")
+  list(text = text, bytes = size, truncated = size > keep)
+}
+
+background_job_io_summary <- function(job_info, tail_bytes = 8192L) {
+  captured <- read_background_text(job_info$capture_path, tail_bytes)
+  stdout <- read_background_text(job_info$stdout_path, tail_bytes)
+  stderr <- read_background_text(job_info$stderr_path, tail_bytes)
+  list(
+    mode = if (!is.null(job_info$stdout_path)) "file_backed" else "legacy_pipe",
+    capture_bytes = captured$bytes,
+    stdout_bytes = stdout$bytes,
+    stderr_bytes = stderr$bytes,
+    capture_tail = captured$text,
+    stdout_tail = stdout$text,
+    stderr_tail = stderr$text
+  )
+}
+
+collect_background_output <- function(job_info) {
+  captured <- read_background_text(job_info$capture_path)
+  stdout <- read_background_text(job_info$stdout_path)
+  stderr <- read_background_text(job_info$stderr_path)
+  pieces <- Filter(nzchar, c(captured$text, stdout$text))
+  list(
+    output = paste(pieces, collapse = if (length(pieces) > 1L) "\n" else ""),
+    stderr = stderr$text,
+    output_bytes = captured$bytes + stdout$bytes,
+    stderr_bytes = stderr$bytes,
+    output_truncated = isTRUE(captured$truncated) || isTRUE(stdout$truncated),
+    stderr_truncated = isTRUE(stderr$truncated)
+  )
+}
+
+# Drain pre-file-backed jobs without changing their identity or process state.
+drain_background_job_io <- function(job_id, output_dir) {
+  if (!exists(job_id, envir = .claude_bg_jobs, inherits = FALSE)) {
+    return(list(job_id = job_id, found = FALSE, alive = FALSE))
+  }
+  job_info <- .claude_bg_jobs[[job_id]]
+  if (is.null(job_info$process)) {
+    return(list(job_id = job_id, found = TRUE, alive = FALSE))
+  }
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  append_bytes <- function(path, bytes) {
+    if (!is.raw(bytes) || !length(bytes)) return(0L)
+    connection <- file(path, open = "ab")
+    on.exit(close(connection), add = TRUE)
+    writeBin(bytes, connection)
+    flush(connection)
+    length(bytes)
+  }
+  process <- job_info$process
+  read_bytes <- function(stream) tryCatch(
+    if (identical(stream, "stdout")) process$read_output_bytes(-1L)
+    else process$read_error_bytes(-1L),
+    error = function(error) raw(0)
+  )
+  list(
+    job_id = job_id,
+    found = TRUE,
+    alive = tryCatch(isTRUE(process$is_alive()), error = function(error) FALSE),
+    stdout_bytes = append_bytes(
+      file.path(output_dir, paste0(job_id, ".stdout.bin")), read_bytes("stdout")
+    ),
+    stderr_bytes = append_bytes(
+      file.path(output_dir, paste0(job_id, ".stderr.bin")), read_bytes("stderr")
+    )
+  )
+}
+
 background_parallel_guidance <- function(output_names = character(0)) {
   list(
     main_session_available = TRUE,
@@ -362,6 +476,9 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
     tempfile(pattern = paste0("clauder_async_out_", job_id, "_"), fileext = ".rds")
   } else NULL
   progress_path <- tempfile(pattern = paste0("clauder_async_progress_", job_id, "_"), fileext = ".rds")
+  capture_path <- tempfile(pattern = paste0("clauder_async_capture_", job_id, "_"), fileext = ".log")
+  stdout_path <- tempfile(pattern = paste0("clauder_async_stdout_", job_id, "_"), fileext = ".log")
+  stderr_path <- tempfile(pattern = paste0("clauder_async_stderr_", job_id, "_"), fileext = ".log")
   write_background_progress(progress_path, stage = "submitted", message = "Job accepted")
 
   # Log / print
@@ -377,7 +494,7 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
 
   # Launch in a separate R process (skip .Rprofile to avoid startup noise in stderr)
   job <- callr::r_bg(function(code, inputs_path, outputs_path, output_names,
-                             progress_path) {
+                             progress_path, capture_path) {
     work_env <- new.env(parent = globalenv())
 
     work_env$clauder_progress <- function(stage, message = NULL, percent = NULL) {
@@ -397,20 +514,22 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
       list2env(.clauder_inputs, envir = work_env)
     }
 
-    output_lines <- utils::capture.output({
+    utils::capture.output({
       .clauder_result <- withVisible(eval(parse(text = code), envir = work_env))
       if (.clauder_result$visible) print(.clauder_result$value)
-    })
+    }, file = capture_path)
 
     if (length(output_names) > 0 && !is.null(outputs_path)) {
       collected <- mget(output_names, envir = work_env, ifnotfound = list(NULL))
       saveRDS(collected, outputs_path)
     }
 
-    list(success = TRUE, output = paste(output_lines, collapse = "\n"))
+    list(success = TRUE)
   }, args = list(code = code, inputs_path = inputs_path, outputs_path = outputs_path,
-                 output_names = output_names, progress_path = progress_path),
-     supervise = TRUE, user_profile = FALSE)
+                 output_names = output_names, progress_path = progress_path,
+                 capture_path = capture_path),
+     supervise = TRUE, user_profile = FALSE,
+     stdout = stdout_path, stderr = stderr_path)
 
   .claude_bg_jobs[[job_id]] <- list(
     process = job,
@@ -423,7 +542,10 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
     inputs_path = inputs_path,
     outputs_path = outputs_path,
     output_names = output_names,
-    progress_path = progress_path
+    progress_path = progress_path,
+    capture_path = capture_path,
+    stdout_path = stdout_path,
+    stderr_path = stderr_path
   )
 
   # Record submission in history (completion is tracked by the job itself)
@@ -469,9 +591,7 @@ kill_background_job <- function(job_id) {
   metadata <- background_job_metadata(job_id, job_info)
 
   # Cleanup marshaling tempfiles regardless of state.
-  for (p in c(job_info$inputs_path, job_info$outputs_path, job_info$progress_path)) {
-    if (!is.null(p) && file.exists(p)) try(file.remove(p), silent = TRUE)
-  }
+  cleanup_background_files(job_info)
 
   rm(list = job_id, envir = .claude_bg_jobs)
 
@@ -514,18 +634,13 @@ check_background_job <- function(job_id) {
       status = "running",
       elapsed_seconds = round(elapsed),
       progress = read_background_progress(job_info$progress_path),
+      io = background_job_io_summary(job_info),
       metadata = background_job_metadata(job_id, job_info),
       parallel_guidance = background_parallel_guidance(job_info$output_names)
     ))
   }
 
   # Best-effort cleanup of marshaling tempfiles regardless of outcome.
-  cleanup_files <- function() {
-    for (p in c(job_info$inputs_path, job_info$outputs_path, job_info$progress_path)) {
-      if (!is.null(p) && file.exists(p)) try(file.remove(p), silent = TRUE)
-    }
-  }
-
   # Summarize a marshaled-back object for the agent (class + shape).
   summarize_obj <- function(name, obj) {
     cls <- paste(class(obj), collapse = "/")
@@ -553,9 +668,11 @@ check_background_job <- function(job_id) {
 
     final_progress <- read_background_progress(job_info$progress_path)
     metadata <- background_job_metadata(job_id, job_info)
-    cleanup_files()
+    io_result <- collect_background_output(job_info)
+    cleanup_background_files(job_info)
 
     out <- c(list(status = "complete"), result)
+    out[names(io_result)] <- io_result
     if (!is.null(final_progress)) out$progress <- final_progress
     if (length(marshaled_summary) > 0) {
       out$marshaled_outputs <- marshaled_summary
@@ -574,7 +691,8 @@ check_background_job <- function(job_id) {
     err_msg <- if (!is.null(e$parent)) e$parent$message else e$message
     final_progress <- read_background_progress(job_info$progress_path)
     metadata <- background_job_metadata(job_id, job_info)
-    cleanup_files()
+    io_result <- collect_background_output(job_info)
+    cleanup_background_files(job_info)
     out <- list(
       status = "complete",
       success = FALSE,
@@ -583,6 +701,7 @@ check_background_job <- function(job_id) {
       metadata = metadata,
       parallel_guidance = background_parallel_guidance(metadata$output_names)
     )
+    out[names(io_result)] <- io_result
     .claude_bg_jobs[[job_id]] <- list(final = out, started = job_info$started)
     return(out)
   })

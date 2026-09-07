@@ -20,40 +20,206 @@ discovery_dir <- function() {
   file.path(base, ".claude_r_sessions")
 }
 
-write_discovery_file <- function(session_name, port) {
+# The discovery file doubles as the shared-secret channel between R and the
+# Python MCP bridge: the bridge reads `token` and echoes it back in the
+# X-Clauder-Token header. Written 0600 so other local users cannot read it.
+generate_session_token <- function() {
+  # Prefer OS entropy: unguessable, and touches nothing in the R session.
+  # /dev/urandom exists on macOS and Linux.
+  bytes <- tryCatch({
+    con <- file("/dev/urandom", "rb")
+    on.exit(close(con), add = TRUE)
+    readBin(con, "raw", 32L)
+  }, error = function(e) NULL, warning = function(w) NULL)
+  if (!is.null(bytes) && length(bytes) == 32L) {
+    return(paste(sprintf("%02x", as.integer(bytes)), collapse = ""))
+  }
+
+  # Fallback (Windows): time/pid-seeded RNG. Must not disturb the caller's
+  # RNG stream -- this is a reproducibility tool, and silently advancing
+  # .Random.seed when the server starts would change the results of any
+  # subsequent set.seed()-less simulation. Snapshot, reseed, then put the
+  # user's stream back exactly as we found it.
+  had_seed <- exists(".Random.seed", envir = globalenv(), inherits = FALSE)
+  old_seed <- if (had_seed) get(".Random.seed", envir = globalenv()) else NULL
+  on.exit({
+    if (had_seed) {
+      assign(".Random.seed", old_seed, envir = globalenv())
+    } else if (exists(".Random.seed", envir = globalenv(), inherits = FALSE)) {
+      rm(".Random.seed", envir = globalenv())
+    }
+  }, add = TRUE)
+
+  set.seed(NULL)  # reseed from time/pid entropy
+  paste(sprintf("%02x", sample.int(256L, 32L, replace = TRUE) - 1L), collapse = "")
+}
+
+discovery_path <- function(session_name) {
+  if (length(session_name) != 1L || is.na(session_name) || !nzchar(session_name) ||
+      session_name %in% c(".", "..") || grepl('[\\\\/:<>"|?*[:cntrl:]]', session_name, perl = TRUE)) {
+    stop("Invalid discovery session name")
+  }
+  file.path(discovery_dir(), paste0(session_name, ".json"))
+}
+
+with_discovery_lock <- function(f, code) {
+  lock <- paste0(f, ".lock")
+  if (!dir.create(lock, showWarnings = FALSE, mode = "0700")) {
+    stop("Discovery record is locked; do not remove another writer's lock")
+  }
+  on.exit(unlink(lock, recursive = TRUE), add = TRUE)
+  force(code)
+}
+
+pid_is_alive <- function(pid) {
+  if (length(pid) != 1L) return(NA)
+  pid <- suppressWarnings(as.integer(pid))
+  if (is.na(pid) || pid <= 0L) return(NA)
+  # ps uses read-only native probes on both Windows and POSIX; permission errors
+  # remain unknown, rather than permission to delete a live session's record.
+  tryCatch(pid %in% ps::ps_pids(), error = function(e) NA)
+}
+
+write_discovery_file <- function(session_name, port, token) {
   d <- discovery_dir()
-  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
-  info <- list(
-    session_name = session_name,
-    port = port,
-    pid = Sys.getpid(),
-    started_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S")
-  )
-  jsonlite::write_json(info, file.path(d, paste0(session_name, ".json")),
-                       auto_unbox = TRUE, pretty = TRUE)
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE, mode = "0700")
+  f <- discovery_path(session_name)
+  with_discovery_lock(f, {
+    other <- if (file.exists(f)) jsonlite::fromJSON(f) else NULL
+    if (!is.null(other) && (!is.list(other) || length(other$pid) != 1L)) {
+      stop("Unreadable discovery identity; explicit inspection required")
+    }
+    if (!is.null(other) && !identical(as.integer(other$pid), Sys.getpid()) &&
+        !identical(pid_is_alive(other$pid), FALSE)) {
+      stop(sprintf("Session name '%s' is already owned by a live or unknown process", session_name))
+    }
+    same_owner <- !is.null(other) && identical(as.integer(other$pid), Sys.getpid()) &&
+      identical(other$token, token)
+    started <- if (same_owner && !is.null(other$started_at)) other$started_at else
+      format(Sys.time(), "%Y-%m-%dT%H:%M:%S")
+    info <- list(session_name = session_name, port = as.integer(port),
+                 pid = Sys.getpid(), token = token, started_at = started)
+    tmp <- tempfile(pattern = ".discovery-", tmpdir = d)
+    on.exit(if (file.exists(tmp)) unlink(tmp), add = TRUE)
+    file.create(tmp)
+    Sys.chmod(tmp, mode = "0600")
+    jsonlite::write_json(info, tmp, auto_unbox = TRUE, pretty = TRUE)
+    # libuv rename replaces the destination atomically, including on Windows.
+    fs::file_move(tmp, f)
+  })
+  invisible(f)
 }
 
 remove_discovery_file <- function(session_name) {
-  f <- file.path(discovery_dir(), paste0(session_name, ".json"))
-  if (file.exists(f)) file.remove(f)
+  f <- discovery_path(session_name)
+  if (!file.exists(f)) return(invisible(NULL))
+  with_discovery_lock(f, {
+    info <- tryCatch(jsonlite::fromJSON(f), error = function(e) NULL)
+    if (is.list(info) && identical(as.integer(info$pid), Sys.getpid())) file.remove(f)
+  })
+  invisible(NULL)
 }
 
 cleanup_stale_discovery_files <- function() {
   d <- discovery_dir()
   if (!dir.exists(d)) return(invisible(NULL))
-  files <- list.files(d, pattern = "\\.json$", full.names = TRUE)
-  for (f in files) {
-    tryCatch({
+  for (f in list.files(d, pattern = "\\.json$", full.names = TRUE)) {
+    tryCatch(with_discovery_lock(f, {
       info <- jsonlite::fromJSON(f)
-      # signal = 0 checks if PID exists without killing it
-      pid_alive <- tools::pskill(info$pid, signal = 0)
-      if (!isTRUE(pid_alive)) file.remove(f)
-    }, error = function(e) {
-      # Corrupted file, remove it
-      file.remove(f)
-    })
+      if (is.list(info) && identical(pid_is_alive(info$pid), FALSE)) file.remove(f)
+    }), error = function(e) NULL) # locked, corrupt or unreadable is NOT stale
   }
   invisible(NULL)
+}
+
+# --- Plot Draw Detection ---
+# Comparing recordPlot() snapshots before/after eval cannot distinguish
+# "redrew the same figure" from "drew nothing": both leave a byte-identical
+# display list. A genuine redraw is therefore misread as stale and the agent
+# silently stops receiving images from the third identical redraw onward.
+#
+# Drawing *events* answer the question the snapshot comparison cannot.
+# plot.new()/grid.newpage() fire on every new plot; the rest fire when code
+# adds to an existing one. Tracing is installed once per session rather than
+# per call, so it costs nothing on the hot path -- which also lets us drop the
+# two recordPlot() deep-copies that previously ran on every single execution,
+# including calls that touch no graphics at all.
+.claude_plot_env <- new.env(parent = emptyenv())
+.claude_plot_env$drew <- FALSE
+.claude_plot_env$devs <- integer(0)   # device ids drawn on during the current execution
+.claude_plot_env$traced <- NULL
+
+.claude_draw_fns <- list(
+  graphics = c("plot.new", "plot.xy", "abline", "text.default", "mtext",
+               "title", "axis", "box", "legend", "rect", "polygon",
+               "segments", "arrows"),
+  grid     = c("grid.newpage", "grid.draw")
+)
+
+install_draw_tracers <- function() {
+  if (!is.null(.claude_plot_env$traced)) return(invisible(.claude_plot_env$traced))
+
+  # The tracer is evaluated inside the traced function's own namespace, so it
+  # cannot reference names defined here. bquote() splices the environment
+  # object itself into the call, making it self-contained wherever it runs.
+  # It records *which device* was drawn on: a draw event alone cannot tell a
+  # screen plot from `png(...); plot(...); dev.off()`, and capturing after a
+  # file-device-only draw would resend whatever old figure the screen holds.
+  tracer <- bquote({
+    .e <- .(.claude_plot_env)
+    .e$drew <- TRUE
+    .e$devs <- unique(c(.e$devs, grDevices::dev.cur()))
+  })
+
+  installed <- list()
+  for (pkg in names(.claude_draw_fns)) {
+    if (!requireNamespace(pkg, quietly = TRUE)) next
+
+    # Both bindings must be traced. The namespace binding catches internal
+    # calls (points() -> plot.xy()); the attached package binding catches the
+    # user's top-level calls. Tracing only the namespace silently misses
+    # abline(), which reaches the device via .External.graphics() without
+    # passing through any other traced function.
+    envs <- list(asNamespace(pkg))
+    attached <- paste0("package:", pkg)
+    if (attached %in% search()) envs <- c(envs, list(as.environment(attached)))
+
+    for (fn in .claude_draw_fns[[pkg]]) {
+      for (env in envs) {
+        ok <- tryCatch({
+          suppressMessages(trace(fn, tracer = tracer, print = FALSE, where = env))
+          TRUE
+        }, error = function(e) FALSE)
+        if (ok) installed[[length(installed) + 1L]] <- list(fn = fn, where = env)
+      }
+    }
+  }
+  .claude_plot_env$traced <- installed
+  invisible(installed)
+}
+
+remove_draw_tracers <- function() {
+  tr <- .claude_plot_env$traced
+  if (!is.null(tr)) {
+    for (t in tr) {
+      try(suppressMessages(untrace(t$fn, where = t$where)), silent = TRUE)
+    }
+  }
+  .claude_plot_env$traced <- NULL
+  invisible(NULL)
+}
+
+.onUnload <- function(libpath) {
+  remove_draw_tracers()
+}
+
+# TRUE when the current device is a screen device we can meaningfully
+# dev.copy() from. File devices (png, pdf, ...) either keep no display list
+# or hold content the code is deliberately writing elsewhere.
+is_screen_device <- function() {
+  if (is.null(grDevices::dev.list())) return(FALSE)
+  dn <- names(grDevices::dev.cur())
+  identical(dn, "RStudioGD") || isTRUE(dn %in% grDevices::deviceIsInteractive())
 }
 
 # --- Agent History Environment ---
@@ -70,7 +236,7 @@ cleanup_stale_discovery_files <- function() {
 .claude_viewer_env$suppress <- FALSE
 
 wrap_viewer <- function() {
-  # Don't double-wrap — if we already saved the original, skip
+  # Don't double-wrap -- if we already saved the original, skip
 
   if (!is.null(.claude_viewer_env$original_viewer)) return(invisible())
   orig <- getOption("viewer")
@@ -107,10 +273,174 @@ unwrap_viewer <- function() {
 .claude_server_env$port <- NULL
 .claude_server_env$session_name <- NULL
 .claude_server_env$execution_count <- 0L
+.claude_server_env$token <- NULL
 
 # --- Background Jobs (callr) ---
 # Package-level environment for non-blocking async execution.
 .claude_bg_jobs <- new.env(parent = emptyenv())
+
+read_background_progress <- function(progress_path) {
+  if (is.null(progress_path) || !file.exists(progress_path)) return(NULL)
+  tryCatch(readRDS(progress_path), error = function(e) NULL)
+}
+
+write_background_progress <- function(progress_path, stage, message = NULL,
+                                      percent = NULL) {
+  if (is.null(progress_path)) return(invisible(NULL))
+  progress <- list(
+    stage = stage,
+    message = message,
+    percent = percent,
+    updated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+  )
+  saveRDS(progress, progress_path)
+  invisible(progress)
+}
+
+async_output_limit <- function() {
+  configured <- suppressWarnings(as.numeric(Sys.getenv(
+    "CLAUDER_ASYNC_OUTPUT_MAX_BYTES", unset = "1048576"
+  )))
+  if (!is.finite(configured) || configured < 1024) configured <- 1048576
+  as.integer(min(configured, .Machine$integer.max))
+}
+
+background_job_files <- function(job_info) {
+  unname(Filter(
+    function(path) !is.null(path) && length(path) == 1L && nzchar(path),
+    list(
+      job_info$inputs_path,
+      job_info$outputs_path,
+      job_info$progress_path,
+      job_info$capture_path,
+      job_info$stdout_path,
+      job_info$stderr_path
+    )
+  ))
+}
+
+cleanup_background_files <- function(job_info) {
+  for (path in background_job_files(job_info)) {
+    if (file.exists(path)) try(file.remove(path), silent = TRUE)
+  }
+  invisible(NULL)
+}
+
+read_background_text <- function(path, max_bytes = async_output_limit()) {
+  if (is.null(path) || !file.exists(path)) {
+    return(list(text = "", bytes = 0, truncated = FALSE))
+  }
+  size <- suppressWarnings(as.numeric(file.info(path)$size[[1]]))
+  if (!is.finite(size) || size <= 0) {
+    return(list(text = "", bytes = max(0, size), truncated = FALSE))
+  }
+  keep <- min(size, max_bytes)
+  connection <- file(path, open = "rb")
+  on.exit(close(connection), add = TRUE)
+  if (size > keep) seek(connection, where = size - keep, origin = "start")
+  bytes <- readBin(connection, what = "raw", n = keep)
+  text <- if (length(bytes)) rawToChar(bytes) else ""
+  text <- iconv(text, from = "", to = "UTF-8", sub = "byte")
+  list(text = text, bytes = size, truncated = size > keep)
+}
+
+background_job_io_summary <- function(job_info, tail_bytes = 8192L) {
+  captured <- read_background_text(job_info$capture_path, tail_bytes)
+  stdout <- read_background_text(job_info$stdout_path, tail_bytes)
+  stderr <- read_background_text(job_info$stderr_path, tail_bytes)
+  list(
+    mode = if (!is.null(job_info$stdout_path)) "file_backed" else "legacy_pipe",
+    capture_bytes = captured$bytes,
+    stdout_bytes = stdout$bytes,
+    stderr_bytes = stderr$bytes,
+    capture_tail = captured$text,
+    stdout_tail = stdout$text,
+    stderr_tail = stderr$text
+  )
+}
+
+collect_background_output <- function(job_info) {
+  captured <- read_background_text(job_info$capture_path)
+  stdout <- read_background_text(job_info$stdout_path)
+  stderr <- read_background_text(job_info$stderr_path)
+  pieces <- Filter(nzchar, c(captured$text, stdout$text))
+  list(
+    output = paste(pieces, collapse = if (length(pieces) > 1L) "\n" else ""),
+    stderr = stderr$text,
+    output_bytes = captured$bytes + stdout$bytes,
+    stderr_bytes = stderr$bytes,
+    output_truncated = isTRUE(captured$truncated) || isTRUE(stdout$truncated),
+    stderr_truncated = isTRUE(stderr$truncated)
+  )
+}
+
+# Drain pre-file-backed jobs without changing their identity or process state.
+drain_background_job_io <- function(job_id, output_dir) {
+  if (!exists(job_id, envir = .claude_bg_jobs, inherits = FALSE)) {
+    return(list(job_id = job_id, found = FALSE, alive = FALSE))
+  }
+  job_info <- .claude_bg_jobs[[job_id]]
+  if (is.null(job_info$process)) {
+    return(list(job_id = job_id, found = TRUE, alive = FALSE))
+  }
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  append_bytes <- function(path, bytes) {
+    if (!is.raw(bytes) || !length(bytes)) return(0L)
+    connection <- file(path, open = "ab")
+    on.exit(close(connection), add = TRUE)
+    writeBin(bytes, connection)
+    flush(connection)
+    length(bytes)
+  }
+  process <- job_info$process
+  read_bytes <- function(stream) tryCatch(
+    if (identical(stream, "stdout")) process$read_output_bytes(-1L)
+    else process$read_error_bytes(-1L),
+    error = function(error) raw(0)
+  )
+  list(
+    job_id = job_id,
+    found = TRUE,
+    alive = tryCatch(isTRUE(process$is_alive()), error = function(error) FALSE),
+    stdout_bytes = append_bytes(
+      file.path(output_dir, paste0(job_id, ".stdout.bin")), read_bytes("stdout")
+    ),
+    stderr_bytes = append_bytes(
+      file.path(output_dir, paste0(job_id, ".stderr.bin")), read_bytes("stderr")
+    )
+  )
+}
+
+background_parallel_guidance <- function(output_names = character(0)) {
+  list(
+    main_session_available = TRUE,
+    safe_parallel_work = "Lightweight read-only commands in the main session are safe while the async job runs.",
+    avoid_parallel_work = paste(
+      "Avoid long synchronous main-session jobs, mutating the same output objects,",
+      "or writing the same files/directories used by the async job."
+    ),
+    output_names = unname(as.character(output_names)),
+    cancel_note = paste(
+      "Cancelling kills the background process and cleans marshaling tempfiles,",
+      "but it does not roll back durable files already written by user code."
+    )
+  )
+}
+
+background_job_metadata <- function(job_id, job_info) {
+  output_names <- if (!is.null(job_info$output_names)) job_info$output_names else character(0)
+  input_names <- if (!is.null(job_info$input_names)) job_info$input_names else character(0)
+  list(
+    job_id = job_id,
+    agent_id = if (!is.null(job_info$agent_id)) job_info$agent_id else "unknown",
+    session_name = if (!is.null(job_info$session_name)) job_info$session_name else NA_character_,
+    session_port = if (!is.null(job_info$session_port)) job_info$session_port else NA_integer_,
+    started_at = if (!is.null(job_info$started)) format(job_info$started, "%Y-%m-%d %H:%M:%S %Z") else NA_character_,
+    input_names = unname(as.character(input_names)),
+    output_names = unname(as.character(output_names)),
+    main_session_available = TRUE
+  )
+}
 
 #' Start a background R job via callr
 #' @param code R code to execute in a separate process
@@ -150,6 +480,11 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
   outputs_path <- if (length(output_names) > 0) {
     tempfile(pattern = paste0("clauder_async_out_", job_id, "_"), fileext = ".rds")
   } else NULL
+  progress_path <- tempfile(pattern = paste0("clauder_async_progress_", job_id, "_"), fileext = ".rds")
+  capture_path <- tempfile(pattern = paste0("clauder_async_capture_", job_id, "_"), fileext = ".log")
+  stdout_path <- tempfile(pattern = paste0("clauder_async_stdout_", job_id, "_"), fileext = ".log")
+  stderr_path <- tempfile(pattern = paste0("clauder_async_stderr_", job_id, "_"), fileext = ".log")
+  write_background_progress(progress_path, stage = "submitted", message = "Job accepted")
 
   # Log / print
   if (settings$print_to_console) {
@@ -163,50 +498,77 @@ start_background_job <- function(code, job_id, settings = NULL, agent_id = NULL,
   }
 
   # Launch in a separate R process (skip .Rprofile to avoid startup noise in stderr)
-  job <- callr::r_bg(function(code, inputs_path, outputs_path, output_names) {
+  job <- callr::r_bg(function(code, inputs_path, outputs_path, output_names,
+                             progress_path, capture_path) {
     work_env <- new.env(parent = globalenv())
+
+    work_env$clauder_progress <- function(stage, message = NULL, percent = NULL) {
+      progress <- list(
+        stage = stage,
+        message = message,
+        percent = percent,
+        updated_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+      )
+      saveRDS(progress, progress_path)
+      invisible(progress)
+    }
+    work_env$clauder_progress("started", "Background process started")
 
     if (!is.null(inputs_path) && file.exists(inputs_path)) {
       .clauder_inputs <- readRDS(inputs_path)
       list2env(.clauder_inputs, envir = work_env)
     }
 
-    output_lines <- utils::capture.output({
+    utils::capture.output({
       .clauder_result <- withVisible(eval(parse(text = code), envir = work_env))
       if (.clauder_result$visible) print(.clauder_result$value)
-    })
+    }, file = capture_path)
 
     if (length(output_names) > 0 && !is.null(outputs_path)) {
       collected <- mget(output_names, envir = work_env, ifnotfound = list(NULL))
       saveRDS(collected, outputs_path)
     }
 
-    list(success = TRUE, output = paste(output_lines, collapse = "\n"))
+    list(success = TRUE)
   }, args = list(code = code, inputs_path = inputs_path, outputs_path = outputs_path,
-                 output_names = output_names),
-     supervise = TRUE, user_profile = FALSE)
+                 output_names = output_names, progress_path = progress_path,
+                 capture_path = capture_path),
+     supervise = TRUE, user_profile = FALSE,
+     stdout = stdout_path, stderr = stderr_path)
 
   .claude_bg_jobs[[job_id]] <- list(
     process = job,
     started = Sys.time(),
     code = code,
     agent_id = agent_id,
+    session_name = .claude_server_env$session_name,
+    session_port = .claude_server_env$port,
+    input_names = input_names,
     inputs_path = inputs_path,
     outputs_path = outputs_path,
-    output_names = output_names
+    output_names = output_names,
+    progress_path = progress_path,
+    capture_path = capture_path,
+    stdout_path = stdout_path,
+    stderr_path = stderr_path
   )
 
-  # Record in history
+  # Record submission in history (completion is tracked by the job itself)
   history_entry <- list(
     timestamp = Sys.time(),
     agent_id = if (!is.null(agent_id)) agent_id else "unknown",
-    code = code,
+    code = paste0("[async job ", job_id, " submitted] ", code),
     success = TRUE,
     has_plot = FALSE
   )
   .claude_history_env$entries <- c(.claude_history_env$entries, list(history_entry))
 
-  list(success = TRUE, job_id = job_id)
+  list(
+    success = TRUE,
+    job_id = job_id,
+    metadata = background_job_metadata(job_id, .claude_bg_jobs[[job_id]]),
+    parallel_guidance = background_parallel_guidance(output_names)
+  )
 }
 
 #' Kill a running background job
@@ -230,10 +592,11 @@ kill_background_job <- function(job_id) {
     tryCatch(job$kill_tree(), error = function(e) NULL)
   }
 
+  last_progress <- read_background_progress(job_info$progress_path)
+  metadata <- background_job_metadata(job_id, job_info)
+
   # Cleanup marshaling tempfiles regardless of state.
-  for (p in c(job_info$inputs_path, job_info$outputs_path)) {
-    if (!is.null(p) && file.exists(p)) try(file.remove(p), silent = TRUE)
-  }
+  cleanup_background_files(job_info)
 
   rm(list = job_id, envir = .claude_bg_jobs)
 
@@ -241,7 +604,14 @@ kill_background_job <- function(job_id) {
     status = "cancelled",
     success = TRUE,
     was_alive = was_alive,
-    elapsed_seconds = round(elapsed)
+    elapsed_seconds = round(elapsed),
+    progress = last_progress,
+    metadata = metadata,
+    cleanup_note = paste(
+      "Marshaled input/output/progress tempfiles were cleaned.",
+      "Durable files written by the async code are not rolled back automatically."
+    ),
+    parallel_guidance = background_parallel_guidance(metadata$output_names)
   )
 }
 
@@ -253,20 +623,29 @@ check_background_job <- function(job_id) {
   }
 
   job_info <- .claude_bg_jobs[[job_id]]
+
+  # Already collected: replay the stored result. This makes polling
+  # idempotent -- if the bridge timed out mid-collection, its retry still
+  # gets the output instead of a spurious not_found.
+  if (!is.null(job_info$final)) {
+    return(job_info$final)
+  }
+
   job <- job_info$process
 
   if (job$is_alive()) {
     elapsed <- as.numeric(difftime(Sys.time(), job_info$started, units = "secs"))
-    return(list(status = "running", elapsed_seconds = round(elapsed)))
+    return(list(
+      status = "running",
+      elapsed_seconds = round(elapsed),
+      progress = read_background_progress(job_info$progress_path),
+      io = background_job_io_summary(job_info),
+      metadata = background_job_metadata(job_id, job_info),
+      parallel_guidance = background_parallel_guidance(job_info$output_names)
+    ))
   }
 
   # Best-effort cleanup of marshaling tempfiles regardless of outcome.
-  cleanup_files <- function() {
-    for (p in c(job_info$inputs_path, job_info$outputs_path)) {
-      if (!is.null(p) && file.exists(p)) try(file.remove(p), silent = TRUE)
-    }
-  }
-
   # Summarize a marshaled-back object for the agent (class + shape).
   summarize_obj <- function(name, obj) {
     cls <- paste(class(obj), collapse = "/")
@@ -278,7 +657,7 @@ check_background_job <- function(job_id) {
     sprintf("  %s: %s [%s]", name, cls, shape)
   }
 
-  # Job finished — get result
+  # Job finished -- get result
   tryCatch({
     result <- job$get_result()
 
@@ -292,20 +671,44 @@ check_background_job <- function(job_id) {
       }
     }
 
-    cleanup_files()
-    rm(list = job_id, envir = .claude_bg_jobs)
+    final_progress <- read_background_progress(job_info$progress_path)
+    metadata <- background_job_metadata(job_id, job_info)
+    io_result <- collect_background_output(job_info)
+    cleanup_background_files(job_info)
 
     out <- c(list(status = "complete"), result)
+    out[names(io_result)] <- io_result
+    if (!is.null(final_progress)) out$progress <- final_progress
     if (length(marshaled_summary) > 0) {
       out$marshaled_outputs <- marshaled_summary
+      out$output_object_note <- "Objects listed in metadata$output_names were assigned into the main session at completion."
     }
+    out$metadata <- metadata
+    out$parallel_guidance <- background_parallel_guidance(metadata$output_names)
+    if (consensus_banner_needed() && !is.null(out$output)) {
+      out$output <- paste0(out$output, "\n\n", CONSENSUS_BANNER)
+    }
+    # Keep the result (not the process) so later polls replay it
+    .claude_bg_jobs[[job_id]] <- list(final = out, started = job_info$started)
     return(out)
   }, error = function(e) {
-    # callr wraps errors — dig out the original message
+    # callr wraps errors -- dig out the original message
     err_msg <- if (!is.null(e$parent)) e$parent$message else e$message
-    cleanup_files()
-    rm(list = job_id, envir = .claude_bg_jobs)
-    return(list(status = "complete", success = FALSE, error = err_msg))
+    final_progress <- read_background_progress(job_info$progress_path)
+    metadata <- background_job_metadata(job_id, job_info)
+    io_result <- collect_background_output(job_info)
+    cleanup_background_files(job_info)
+    out <- list(
+      status = "complete",
+      success = FALSE,
+      error = err_msg,
+      progress = final_progress,
+      metadata = metadata,
+      parallel_guidance = background_parallel_guidance(metadata$output_names)
+    )
+    out[names(io_result)] <- io_result
+    .claude_bg_jobs[[job_id]] <- list(final = out, started = job_info$started)
+    return(out)
   })
 }
 
@@ -328,12 +731,22 @@ claudeAddin <- function() {
   # Restore state from a still-running server (UI was closed but server kept going)
   resuming <- isTRUE(.claude_server_env$running) && !is.null(.claude_server_env$server)
   server_state <- if (resuming) .claude_server_env$server else NULL
-  running <- resuming
-  execution_count <- .claude_server_env$execution_count
-  active_session_name <- .claude_server_env$session_name
+  if (resuming) {
+    # Refresh discovery without restarting the HTTP server or rotating identity.
+    write_discovery_file(.claude_server_env$session_name,
+                         .claude_server_env$port, .claude_server_env$token)
+  }
 
-  # Load settings
+  # Load settings. The canonical copy lives in .claude_server_env so the HTTP
+  # handler and any reopened addin UI share one set of live values -- otherwise
+  # a reopened UI would edit a fresh frame while the handler kept reading the
+  # frame it closed over at server start, and toggles would silently stop
+  # affecting the running server.
   settings <- load_claude_settings()
+  if (resuming && !is.null(.claude_server_env$settings)) {
+    settings <- .claude_server_env$settings
+  }
+  .claude_server_env$settings <- settings
 
   # Log file is created when the server starts (in the Start Server handler)
   # so we know the session name to include in the filename.
@@ -345,11 +758,60 @@ claudeAddin <- function() {
       port = port,
       app = list(
         call = function(req) {
+          # --- Auth gate ---
+          # Binding to 127.0.0.1 is not a security boundary: any local process
+          # can reach this port, and a webpage can POST to it cross-origin
+          # without a CORS preflight (text/plain body). Both would land as
+          # arbitrary R execution.
+          #
+          # Two independent defences, deliberately decoupled:
+          #
+          # 1. Origin block -- always on. Only browsers set Origin, and the MCP
+          #    bridge never does, so this closes the drive-by-webpage vector at
+          #    zero compatibility cost.
+          # 2. Token check -- opt-in (settings$require_token). Enforcing it
+          #    rejects any bridge older than clauder-mcp 0.6.0, so it stays off
+          #    until the user has updated both halves. Turn it on in Advanced.
+          if (!is.null(req$HTTP_ORIGIN)) {
+            return(list(
+              status = 403L,
+              headers = list('Content-Type' = 'application/json'),
+              body = '{"error": "Forbidden: browser-originated requests are not accepted"}'
+            ))
+          }
+
+          expected_token <- .claude_server_env$token
+          supplied_token <- req$HTTP_X_CLAUDER_TOKEN
+
+          if (isTRUE(.claude_server_env$require_token)) {
+            if (is.null(expected_token) || !identical(supplied_token, expected_token)) {
+              return(list(
+                status = 401L,
+                headers = list('Content-Type' = 'application/json'),
+                body = '{"error": "Unauthorized: missing or invalid X-Clauder-Token. Your clauder-mcp bridge is older than 0.6.0 -- run `uvx --refresh clauder-mcp`, or untick Require token in the addin Advanced panel."}'
+              ))
+            }
+          } else if (is.null(supplied_token) && !isTRUE(.claude_server_env$warned_no_token)) {
+            .claude_server_env$warned_no_token <- TRUE
+            message(
+              "[ClaudeR] Bridge connected without an auth token (clauder-mcp < 0.6.0). ",
+              "Any local process can reach this port. After updating the bridge, ",
+              "tick 'Require token' in the addin's Advanced panel to lock it down."
+            )
+          }
+
           # Handle POST requests (receiving code from Claude)
           if (req$REQUEST_METHOD == "POST") {
             # Parse the request body
             body_raw <- req$rook.input$read()
-            body <- fromJSON(rawToChar(body_raw))
+            body <- tryCatch(fromJSON(rawToChar(body_raw)), error = function(e) NULL)
+            if (is.null(body)) {
+              return(list(
+                status = 400L,
+                headers = list('Content-Type' = 'application/json'),
+                body = '{"error": "Invalid JSON in request body"}'
+              ))
+            }
 
             # --- Check background job status ---
             if (!is.null(body$check_job)) {
@@ -407,12 +869,12 @@ claudeAddin <- function() {
                 input_names  <- if (!is.null(body$input_names))  as.character(body$input_names)  else character(0)
                 output_names <- if (!is.null(body$output_names)) as.character(body$output_names) else character(0)
                 result <- start_background_job(
-                  body$code, body$job_id, settings,
+                  body$code, body$job_id, .claude_server_env$settings,
                   agent_id = agent_id,
                   input_names = input_names,
                   output_names = output_names
                 )
-                execution_count <<- execution_count + 1
+                .claude_server_env$execution_count <- .claude_server_env$execution_count + 1L
                 response_body <- toJSON(result, auto_unbox = TRUE, force = TRUE)
                 return(list(
                   status = 200L,
@@ -422,8 +884,8 @@ claudeAddin <- function() {
               }
 
               # --- Sync: execute in main session ---
-              result <- execute_code_in_session(body$code, settings, agent_id = agent_id)
-              execution_count <<- execution_count + 1
+              result <- execute_code_in_session(body$code, .claude_server_env$settings, agent_id = agent_id)
+              .claude_server_env$execution_count <- .claude_server_env$execution_count + 1L
 
               # Return the result as JSON
               response_body <- toJSON(result, auto_unbox = TRUE, force = TRUE)
@@ -448,13 +910,17 @@ claudeAddin <- function() {
               .claude_history_env$entries,
               function(e) e$agent_id, character(1)
             ))
+            live <- .claude_server_env$settings
             status <- list(
-              running = running,
-              execution_count = execution_count,
-              connected_agents = agent_ids,
+              running = isTRUE(.claude_server_env$running),
+              execution_count = .claude_server_env$execution_count,
+              # as.list() keeps this a JSON array even with one element;
+              # auto_unbox would collapse it to a bare string, which the
+              # bridge then iterates character by character
+              connected_agents = as.list(agent_ids),
               history_size = length(.claude_history_env$entries),
-              session_name = active_session_name,
-              log_file_path = if (settings$log_to_file) settings$log_file_path else NULL
+              session_name = .claude_server_env$session_name,
+              log_file_path = if (isTRUE(live$log_to_file)) live$log_file_path else NULL
             )
 
             return(list(
@@ -497,7 +963,7 @@ claudeAddin <- function() {
       ),
       wellPanel(
         textInput("session_name", "Session Name",
-          value = if (resuming && !is.null(active_session_name)) active_session_name else "default"),
+          value = if (resuming && !is.null(.claude_server_env$session_name)) .claude_server_env$session_name else "default"),
         numericInput("port", "Port",
           value = if (resuming && !is.null(.claude_server_env$port)) .claude_server_env$port else 8787,
           min = 1024, max = 65535),
@@ -536,6 +1002,8 @@ claudeAddin <- function() {
           condition = "input.log_to_file == true",
           textInput("log_file_path", "Log file path",
                            value = settings$log_file_path),
+          checkboxInput("log_console", "Also log my own console commands",
+                           value = isTRUE(settings$log_console)),
           actionButton("open_log", "Open Log File", class = "btn-sm"),
           actionButton("export_script", "Export Clean Script", class = "btn-sm")
         )
@@ -550,7 +1018,18 @@ claudeAddin <- function() {
         )
       ),
       wellPanel(
-        actionButton("kill_process", "Force Release Port", class = "btn-warning btn-sm")
+        actionButton("kill_process", "Force Release Port", class = "btn-warning btn-sm"),
+        tags$hr(style = "margin: 10px 0;"),
+        checkboxInput("require_token",
+          "Require auth token (needs clauder-mcp >= 0.6.0)",
+          value = isTRUE(settings$require_token)
+        ),
+        tags$div(
+          style = "font-size: 11px; color: #777; margin-top: -8px;",
+          "Rejects any request without this session's token. Update your bridge",
+          tags$code("uvx --refresh clauder-mcp"),
+          "before enabling, then restart the server."
+        )
       )
     )
   )
@@ -560,7 +1039,7 @@ claudeAddin <- function() {
     # State management
     state <- reactiveValues(
       running = resuming,
-      execution_count = execution_count
+      execution_count = .claude_server_env$execution_count
     )
 
     # If resuming, re-wrap viewer since we unwrapped at startup
@@ -568,20 +1047,36 @@ claudeAddin <- function() {
       wrap_viewer()
     }
 
-    # Update settings reactively
-    # Watch for settings changes (ignoreInit prevents overwriting on UI load)
-    # Use <<- so the HTTP handler closure sees updated values
+    # Update settings reactively (ignoreInit prevents overwriting on UI load).
+    # Writes go to the canonical copy in .claude_server_env so the HTTP
+    # handler sees them even after the UI was closed and reopened.
+    update_setting <- function(name, value) {
+      s <- .claude_server_env$settings
+      s[[name]] <- value
+      .claude_server_env$settings <- s
+      settings <<- s
+      save_claude_settings(s)
+    }
     observeEvent(input$print_to_console, {
-      settings$print_to_console <<- input$print_to_console
-      save_claude_settings(settings)
+      update_setting("print_to_console", input$print_to_console)
     }, ignoreInit = TRUE)
+    observeEvent(input$log_console, {
+      update_setting("log_console", input$log_console)
+      if (isTRUE(input$log_console)) start_console_logging() else stop_console_logging()
+    }, ignoreInit = TRUE)
+
     observeEvent(input$log_to_file, {
-      settings$log_to_file <<- input$log_to_file
-      save_claude_settings(settings)
+      update_setting("log_to_file", input$log_to_file)
     }, ignoreInit = TRUE)
     observeEvent(input$log_file_path, {
-      settings$log_file_path <<- input$log_file_path
-      save_claude_settings(settings)
+      update_setting("log_file_path", input$log_file_path)
+    }, ignoreInit = TRUE)
+    observeEvent(input$require_token, {
+      update_setting("require_token", input$require_token)
+      if (isTRUE(state$running)) {
+        showNotification("Restart the server for the token setting to take effect.",
+                         type = "warning")
+      }
     }, ignoreInit = TRUE)
 
     # Open log file button
@@ -632,11 +1127,23 @@ claudeAddin <- function() {
       n_agents <- length(agent_ids)
       n_exec <- length(entries)
 
-      if (n_agents == 0) {
-        "No agents connected yet"
+      exec_txt <- if (n_agents == 0) {
+        "No code executed by agents yet"
       } else {
-        agents_str <- paste(agent_ids, collapse = ", ")
-        sprintf("Connected: %s\nExecutions: %d", agents_str, n_exec)
+        sprintf("Executed code: %s\nExecutions: %d",
+                paste(agent_ids, collapse = ", "), n_exec)
+      }
+
+      # Coordination happens on disk without touching R, so agents that only
+      # message each other never appear in the execution history. Surface
+      # them from the event log so the human can see who is actually around.
+      roster <- if (isTRUE(.claude_server_env$running)) {
+        coord_roster_text(.claude_server_env$session_name)
+      } else NULL
+      if (!is.null(roster)) {
+        paste0(exec_txt, "\nCoordinating: ", roster)
+      } else {
+        exec_txt
       }
     })
 
@@ -745,7 +1252,7 @@ claudeAddin <- function() {
 
           # Fresh start: also reset agent history, execution count, console history
           if (isTRUE(input$fresh_start)) {
-            execution_count <<- 0
+            .claude_server_env$execution_count <- 0L
             state$execution_count <- 0
             .claude_history_env$entries <- list()
 
@@ -760,35 +1267,51 @@ claudeAddin <- function() {
             showNotification("Fresh start: log, history, and agents reset", type = "message")
           }
 
+          # Mint the session token before the server starts accepting requests.
+          .claude_server_env$token <- generate_session_token()
+          .claude_server_env$require_token <- isTRUE(input$require_token)
+          .claude_server_env$warned_no_token <- FALSE
+
           server_state <<- start_http_server(input$port)
-          running <<- TRUE
+
+          # Persist resume state immediately: if anything below fails, the
+          # server is already listening and must stay resumable/stoppable.
+          .claude_server_env$server <- server_state
+          .claude_server_env$running <- TRUE
+          .claude_server_env$port <- input$port
           state$running <- TRUE
 
           # Resolve session name
           session_name <- trimws(input$session_name)
           if (session_name == "") session_name <- paste0("session_", input$port)
-          active_session_name <<- session_name
-          write_discovery_file(session_name, input$port)
+          .claude_server_env$session_name <- session_name
+          .claude_server_env$coord_seen <- NULL  # re-baseline coordination echo
+          tryCatch(
+            write_discovery_file(session_name, input$port, .claude_server_env$token),
+            error = function(e) {
+              # Only roll back the server this handler just created. A name
+              # collision must never stop another research session's server.
+              stopServer(server_state)
+              server_state <<- NULL
+              .claude_server_env$server <- NULL
+              .claude_server_env$running <- FALSE
+              state$running <- FALSE
+              stop(e)
+            }
+          )
 
           # Create log file with session name in the filename
-          # Use <<- so the HTTP handler closure sees the updated path
-          if (settings$log_to_file) {
+          if (isTRUE(.claude_server_env$settings$log_to_file)) {
             session_timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
             safe_name <- gsub("[^a-zA-Z0-9_-]", "_", session_name)
-            settings$log_file_path <<- file.path(
-              dirname(settings$log_file_path),
+            new_log <- file.path(
+              dirname(.claude_server_env$settings$log_file_path),
               paste0("clauder_", safe_name, "_", input$port, "_", session_timestamp, ".R")
             )
-            save_claude_settings(settings)
-            write_log_header(settings$log_file_path)
-            updateTextInput(session, "log_file_path", value = settings$log_file_path)
+            update_setting("log_file_path", new_log)
+            write_log_header(new_log)
+            shiny::updateTextInput(session, "log_file_path", value = new_log)
           }
-
-          # Persist state for UI resume
-          .claude_server_env$server <- server_state
-          .claude_server_env$running <- TRUE
-          .claude_server_env$port <- input$port
-          .claude_server_env$session_name <- active_session_name
 
           # Wrap viewer to capture HTML widget URLs
           wrap_viewer()
@@ -809,9 +1332,13 @@ claudeAddin <- function() {
       if (state$running) {
         tryCatch({
           stopServer(server_state)
-          running <<- FALSE
           state$running <- FALSE
           server_state <<- NULL
+
+          # Remove discovery file before clearing the session name
+          if (!is.null(.claude_server_env$session_name)) {
+            remove_discovery_file(.claude_server_env$session_name)
+          }
 
           # Clear persisted state
           .claude_server_env$server <- NULL
@@ -819,20 +1346,17 @@ claudeAddin <- function() {
           .claude_server_env$port <- NULL
           .claude_server_env$session_name <- NULL
           .claude_server_env$execution_count <- 0L
+          .claude_server_env$token <- NULL
 
           # Reset execution count and agent history
-          execution_count <<- 0
           state$execution_count <- 0
           .claude_history_env$entries <- list()
 
-          # Remove discovery file
-          if (!is.null(active_session_name)) {
-            remove_discovery_file(active_session_name)
-            active_session_name <<- NULL
-          }
-
           # Restore original viewer
           unwrap_viewer()
+
+          # Don't leave graphics functions traced in the user's session
+          remove_draw_tracers()
 
           # Force garbage collection to ensure port is released
           gc()
@@ -848,6 +1372,13 @@ claudeAddin <- function() {
     
     # Force release port button handler
     shiny::observeEvent(input$kill_process, {
+      if (.Platform$OS.type == "windows") {
+        shiny::showNotification(
+          "Force Release Port uses lsof/kill and is not available on Windows. Restart the R session instead.",
+          type = "warning"
+        )
+        return(invisible(NULL))
+      }
       # Create a confirmation dialog
       shiny::showModal(shiny::modalDialog(
         title = "Force Release Port",
@@ -885,19 +1416,23 @@ claudeAddin <- function() {
               try(httpuv::stopServer(server_state), silent = TRUE)
               server_state <<- NULL
             }
+            # Remove discovery file before clearing the session name
+            if (!is.null(.claude_server_env$session_name)) {
+              remove_discovery_file(.claude_server_env$session_name)
+            }
+
             .claude_server_env$server <- NULL
             .claude_server_env$running <- FALSE
             .claude_server_env$port <- NULL
             .claude_server_env$session_name <- NULL
             .claude_server_env$execution_count <- 0L
-            running <<- FALSE
+            .claude_server_env$token <- NULL
             state$running <- FALSE
 
-            # Remove discovery file
-            if (!is.null(active_session_name)) {
-              remove_discovery_file(active_session_name)
-              active_session_name <<- NULL
-            }
+            # Restore the viewer and untrace graphics functions -- this path
+            # bypasses Stop Server, which normally does this cleanup
+            unwrap_viewer()
+            remove_draw_tracers()
 
             # Force garbage collection
             gc()
@@ -911,22 +1446,121 @@ claudeAddin <- function() {
         shiny::showNotification(paste0("Error killing process: ", e$message), type = "error")
       })
     })
-    # Update execution count periodically
+    # Refresh the execution count shown in the UI from the canonical state
     observe({
-      state$execution_count <- execution_count
-      .claude_server_env$execution_count <- execution_count
+      state$execution_count <- .claude_server_env$execution_count
       invalidateLater(2000)
     })
 
-    # Close handler — just close the UI, keep the server running
+    # Echo coordination traffic to the console and session log. Coordination
+    # bypasses the R server by design (a busy session cannot block it), so
+    # without this the human sees none of it.
+    observe({
+      invalidateLater(2000)
+      if (!isTRUE(.claude_server_env$running)) return(invisible(NULL))
+      evs <- tryCatch(coord_events(.claude_server_env$session_name),
+                      error = function(e) list())
+      if (length(evs) == 0) return(invisible(NULL))
+      max_id <- max(vapply(evs, function(e) e$id, integer(1)))
+      seen <- .claude_server_env$coord_seen
+      if (is.null(seen)) {
+        # First look at this log: do not replay history into the console
+        .claude_server_env$coord_seen <- max_id
+        return(invisible(NULL))
+      }
+      new_evs <- Filter(function(e) e$id > seen, evs)
+      if (length(new_evs) == 0) return(invisible(NULL))
+      s <- .claude_server_env$settings
+      for (e in new_evs) {
+        line <- tryCatch(format_coord_event(e), error = function(err) NULL)
+        if (is.null(line)) next
+        if (isTRUE(s$print_to_console)) {
+          cat("### coordination ###", line, "\n")
+        }
+        if (isTRUE(s$log_to_file) && !is.null(s$log_file_path) &&
+            nzchar(s$log_file_path)) {
+          try(cat(sprintf("# [coordination] %s\n", line),
+                  file = s$log_file_path, append = TRUE), silent = TRUE)
+        }
+      }
+      .claude_server_env$coord_seen <- max_id
+    })
+
+    # Close handler -- just close the UI, keep the server running
     observeEvent(input$done, {
-      # Persist execution count so it survives UI restart
-      .claude_server_env$execution_count <- execution_count
       invisible(stopApp())
     })
   }
 
   runGadget(ui, server, viewer = paneViewer())
+}
+
+#' Summarize a result value for transport back to the agent
+#'
+#' `output` already carries the printed representation of the value, so
+#' serializing the object itself is only useful when it is small. Anything
+#' larger gets a shape summary instead -- otherwise a visible `1:1e6` would
+#' ship a million numbers as JSON on top of the printed output that already
+#' describes them.
+#'
+#' @param value The value returned by the evaluated code
+#' @param max_len Longest atomic vector to serialize verbatim
+#' @return A JSON-serializable summary of `value`
+summarize_result_value <- function(value, max_len = 100L) {
+  if (is.data.frame(value)) {
+    return(list(
+      is_dataframe = TRUE,
+      dimensions = dim(value),
+      head = utils::head(value, 10)
+    ))
+  }
+  if (inherits(value, "ggplot")) {
+    return("ggplot object - see plot output")
+  }
+  if (is.atomic(value) && length(value) <= max_len && is.null(dim(value))) {
+    return(value)
+  }
+
+  summary <- list(
+    truncated = TRUE,
+    class = paste(class(value), collapse = "/"),
+    length = length(value),
+    note = "Object too large to serialize. See the printed output above."
+  )
+  if (!is.null(dim(value))) summary$dimensions <- dim(value)
+  summary
+}
+
+#' Cap captured console output before sending it to the agent
+#'
+#' A visible large object prints its entire contents to stdout, so uncapped
+#' output is the larger of the two payload bombs (`summarize_result_value`
+#' handles the other). Keeps the head and the tail: the head shows what the
+#' object looks like, and the tail preserves the warnings and messages, which
+#' are appended last and matter most.
+#'
+#' @param lines Character vector of captured output lines
+#' @param max_lines Maximum lines to keep
+#' @param max_chars Hard character ceiling applied after line trimming
+#' @return A single truncated string
+truncate_output <- function(lines, max_lines = 500L, max_chars = 50000L) {
+  if (length(lines) > max_lines) {
+    head_n <- as.integer(max_lines * 0.8)
+    tail_n <- max_lines - head_n
+    lines <- c(
+      utils::head(lines, head_n),
+      sprintf("... [%d lines omitted] ...", length(lines) - max_lines),
+      utils::tail(lines, tail_n)
+    )
+  }
+  txt <- paste(lines, collapse = "\n")
+  if (nchar(txt) > max_chars) {
+    txt <- paste0(
+      substr(txt, 1L, max_chars),
+      sprintf("\n... [output truncated at %d characters]", max_chars)
+    )
+  }
+  txt
 }
 
 #' Execute R code in the active RStudio session
@@ -979,13 +1613,28 @@ execute_code_in_session <- function(code, settings = NULL, agent_id = NULL) {
   plot_file_jpeg <- tempfile(fileext = ".jpeg")
 
   tryCatch({
-    # Create a connection to capture output
+    # Arm draw detection before sink() opens, so trace()'s own one-time
+    # "Tracing function ..." chatter cannot land in the agent's output.
+    tracers <- install_draw_tracers()
+    tracing_active <- length(tracers) > 0
+    .claude_plot_env$drew <- FALSE
+    .claude_plot_env$devs <- integer(0)
+
+    # Create a connection to capture output. Remember the sink depth so
+    # cleanup unwinds exactly the sinks opened during this execution, even
+    # if the executed code called sink() itself and then errored.
     output_file <- tempfile()
+    sink_depth <- sink.number()
     sink(output_file, split = TRUE)  # split=TRUE sends output to console AND capture
 
     # --- BEFORE eval: snapshot device state to detect stale plots ---
     devices_before <- dev.list()
-    baseline_plot <- tryCatch(recordPlot(), error = function(e) NULL)
+    # Only needed for the no-tracing fallback below. When tracing is active this
+    # deep-copy of the display list -- previously paid on every call, graphics or
+    # not -- is skipped entirely.
+    baseline_plot <- if (!tracing_active && !is.null(devices_before)) {
+      tryCatch(recordPlot(), error = function(e) NULL)
+    } else NULL
 
     # Suppress viewer during agent execution so htmlwidgets don't steal the pane
     # Reset last_url so viewer_captured only flags for THIS execution
@@ -993,8 +1642,35 @@ execute_code_in_session <- function(code, settings = NULL, agent_id = NULL) {
     .claude_viewer_env$suppress <- TRUE
     on.exit(.claude_viewer_env$suppress <- FALSE, add = TRUE)
 
+    # Expose the executing agent's identity to coordination functions
+    # (cr_send, confirm_agreement, ...) so attribution needs no arguments.
+    old_agent_env <- Sys.getenv("CLAUDER_AGENT_ID", "")
+    if (!is.null(agent_id) && nzchar(agent_id)) {
+      Sys.setenv(CLAUDER_AGENT_ID = agent_id)
+    }
+    on.exit({
+      if (nzchar(old_agent_env)) Sys.setenv(CLAUDER_AGENT_ID = old_agent_env)
+      else Sys.unsetenv("CLAUDER_AGENT_ID")
+    }, add = TRUE)
+
+    # sink() only diverts stdout. Warnings and message() go to stderr, so
+    # without this the agent never sees them -- including the ones that matter
+    # most (non-convergence, singular fits, NAs introduced by coercion).
+    # Handlers do not muffle: the conditions still reach the console as usual.
+    collected_conditions <- character(0)
+
     # Execute code in the global environment
-    result <- withVisible(eval(parse(text = code), envir = env))
+    result <- withCallingHandlers(
+      withVisible(eval(parse(text = code), envir = env)),
+      warning = function(w) {
+        collected_conditions <<- c(collected_conditions,
+                                   paste0("Warning: ", conditionMessage(w)))
+      },
+      message = function(m) {
+        collected_conditions <<- c(collected_conditions,
+                                   paste0("Message: ", sub("\n$", "", conditionMessage(m))))
+      }
+    )
 
     # Print the result if it would be auto-printed in console
     if (result$visible) {
@@ -1006,6 +1682,24 @@ execute_code_in_session <- function(code, settings = NULL, agent_id = NULL) {
 
     # Read the captured output
     output <- readLines(output_file, warn = FALSE)
+    if (length(collected_conditions) > 0) {
+      output <- c(output, collected_conditions)
+    }
+
+    # This execution's sink was opened on top of the console-logging sink (if
+    # one is active), and split = TRUE cascades, so everything printed here has
+    # also landed in the console buffer. Drop it, or the next thing the user
+    # types would carry the agent's output as if the user had produced it.
+    tryCatch(console_drain(), error = function(e) NULL)
+
+    # Record what the code printed, not just the code. The log is the one file
+    # an agent reads back to see what happened, and until now it showed the
+    # call but never its result.
+    if (settings$log_to_file && !is.null(settings$log_file_path) &&
+        settings$log_file_path != "" && length(output) > 0) {
+      tryCatch(log_output_to_file(output, settings$log_file_path),
+               error = function(e) NULL)
+    }
 
     # --- AFTER eval: only capture if a NEW plot was actually created ---
     captured_plot <- FALSE
@@ -1041,17 +1735,30 @@ execute_code_in_session <- function(code, settings = NULL, agent_id = NULL) {
           })
         })
       }
-      # For base graphics: only capture if device state actually changed
+      # For base graphics: only capture if this execution actually drew something
       else if (!is.null(dev.list())) {
         devices_after <- dev.list()
-        current_plot <- tryCatch(recordPlot(), error = function(e) NULL)
 
-        # Determine if a NEW plot was actually drawn by this execution
-        new_plot_exists <- FALSE
-        if (!identical(devices_before, devices_after)) {
-          new_plot_exists <- TRUE
-        } else if (!is.null(current_plot) && !identical(current_plot, baseline_plot)) {
-          new_plot_exists <- TRUE
+        # A traced draw event is authoritative: it fires on a redraw of an
+        # identical figure, which the old display-list comparison reported as
+        # stale (and so never sent to the agent). It only counts if the draw
+        # landed on the *current, screen* device -- `png(f); plot(x); dev.off()`
+        # fires the tracer too, and capturing then would resend the old figure
+        # still sitting on the screen device.
+        if (tracing_active) {
+          new_plot_exists <- isTRUE(.claude_plot_env$drew) &&
+            (grDevices::dev.cur() %in% .claude_plot_env$devs) &&
+            is_screen_device()
+        } else {
+          new_plot_exists <- !identical(devices_before, devices_after)
+        }
+
+        # Fallback only if tracing could not be installed -- better to pay for
+        # the old comparison than to silently drop plots.
+        if (!new_plot_exists && !tracing_active) {
+          current_plot <- tryCatch(recordPlot(), error = function(e) NULL)
+          new_plot_exists <- !is.null(current_plot) &&
+            !identical(current_plot, baseline_plot)
         }
 
         if (new_plot_exists) {
@@ -1090,30 +1797,18 @@ execute_code_in_session <- function(code, settings = NULL, agent_id = NULL) {
     # Prepare the response
     response <- list(
       success = TRUE,
-      output = paste(output, collapse = "\n")
+      output = truncate_output(output)
     )
+
+    # Consensus gate: while a proposed plan lacks the required verbatim
+    # confirmations, every response carries the banner. Deliberately loud.
+    if (consensus_banner_needed()) {
+      response$output <- paste0(response$output, "\n\n", CONSENSUS_BANNER)
+    }
 
     # Include the result value if available
     if (exists("result") && !is.null(result$value)) {
-      # Add result to response
-      response$result <- if (is.data.frame(result$value)) {
-        # For dataframes, convert to a readable format
-        list(
-          is_dataframe = TRUE,
-          dimensions = dim(result$value),
-          head = utils::head(result$value, 10)
-        )
-      } else if (inherits(result$value, "ggplot")) {
-        # For ggplot objects
-        "ggplot object - see plot output"
-      } else {
-        # For other objects, try to convert to JSON
-        tryCatch({
-          result$value
-        }, error = function(e) {
-          as.character(result$value)
-        })
-      }
+      response$result <- summarize_result_value(result$value)
     }
 
     # Include plot if available
@@ -1140,13 +1835,30 @@ execute_code_in_session <- function(code, settings = NULL, agent_id = NULL) {
     )
     .claude_history_env$entries <- c(.claude_history_env$entries, list(history_entry))
     if (length(.claude_history_env$entries) > .claude_history_env$max_entries) {
-      .claude_history_env$entries <- tail(.claude_history_env$entries, .claude_history_env$max_entries)
+      .claude_history_env$entries <- utils::tail(.claude_history_env$entries, .claude_history_env$max_entries)
     }
 
     return(response)
   }, error = function(e) {
-    # Make sure to close the sink if there was an error
-    if (sink.number() > 0) sink()
+    # Unwind any sinks opened during this execution
+    if (exists("sink_depth")) {
+      while (sink.number() > sink_depth) sink()
+    }
+    # No sink_depth means we failed before opening one. Do NOT pop blindly:
+    # console logging keeps a sink of its own underneath, and popping it
+    # silently stops the user's console from being recorded.
+
+    # Recover whatever was printed before the error: partial output plus
+    # captured warnings/messages are often exactly the context the agent
+    # needs to fix the code
+    partial_output <- character(0)
+    if (exists("output_file") && file.exists(output_file)) {
+      partial_output <- tryCatch(readLines(output_file, warn = FALSE),
+                                 error = function(e2) character(0))
+    }
+    if (exists("collected_conditions") && length(collected_conditions) > 0) {
+      partial_output <- c(partial_output, collected_conditions)
+    }
 
     # Log error if logging is enabled
     if (settings$log_to_file && !is.null(settings$log_file_path) && settings$log_file_path != "") {
@@ -1166,16 +1878,31 @@ execute_code_in_session <- function(code, settings = NULL, agent_id = NULL) {
     )
     .claude_history_env$entries <- c(.claude_history_env$entries, list(history_entry))
     if (length(.claude_history_env$entries) > .claude_history_env$max_entries) {
-      .claude_history_env$entries <- tail(.claude_history_env$entries, .claude_history_env$max_entries)
+      .claude_history_env$entries <- utils::tail(.claude_history_env$entries, .claude_history_env$max_entries)
     }
 
-    return(list(
+    response <- list(
       success = FALSE,
       error = e$message
-    ))
+    )
+    if (length(partial_output) > 0) {
+      response$output <- truncate_output(partial_output)
+    }
+    if (consensus_banner_needed()) {
+      response$output <- paste0(
+        if (is.null(response$output)) "" else paste0(response$output, "\n\n"),
+        CONSENSUS_BANNER
+      )
+    }
+    return(response)
   }, finally = {
-    # Make sure sink is restored
-    if (sink.number() > 0) sink()
+    # Unwind any sinks this execution opened
+    if (exists("sink_depth")) {
+      while (sink.number() > sink_depth) sink()
+    }
+    # No sink_depth means we failed before opening one. Do NOT pop blindly:
+    # console logging keeps a sink of its own underneath, and popping it
+    # silently stops the user's console from being recorded.
 
     # Clean up temporary files
     if (exists("output_file") && file.exists(output_file)) {
@@ -1192,18 +1919,71 @@ execute_code_in_session <- function(code, settings = NULL, agent_id = NULL) {
   })
 }
 
+# Parse execution entries out of past session log files on disk. The
+# in-memory history dies with the R session; the timestamped logs do not,
+# so they are the cross-restart audit trail of who ran what.
+past_history_entries <- function(max_files = 5L) {
+  settings <- load_claude_settings()
+  if (is.null(settings$log_file_path) || !nzchar(settings$log_file_path)) {
+    return(list())
+  }
+  log_dir <- dirname(settings$log_file_path)
+  if (!dir.exists(log_dir)) return(list())
+  files <- list.files(log_dir, pattern = "^clauder_.*\\.R$", full.names = TRUE)
+  files <- setdiff(files, normalizePath(settings$log_file_path, mustWork = FALSE))
+  if (length(files) == 0) return(list())
+  files <- files[order(file.info(files)$mtime, decreasing = TRUE)]
+  files <- utils::head(files, max_files)
+
+  entries <- list()
+  for (f in files) {
+    lines <- tryCatch(readLines(f, warn = FALSE), error = function(e) character(0))
+    starts <- grep("^# --- \\[", lines)
+    if (length(starts) == 0) next
+    ends <- c(starts[-1] - 1L, length(lines))
+    for (k in seq_along(starts)) {
+      block <- lines[starts[k]:ends[k]]
+      ts <- sub("^# --- \\[(.*)\\] ---$", "\\1", block[1])
+      agent_line <- if (length(block) >= 2) block[2] else ""
+      agent <- sub("^# Code executed by ([^ ]+).*$", "\\1", agent_line)
+      agent <- sub(":$", "", agent)
+      code_lines <- block[!grepl("^# --- \\[|^# Code executed by |^# Run by |^# Error: |^#> ", block)]
+      code_lines <- code_lines[nzchar(trimws(code_lines))]
+      entries[[length(entries) + 1L]] <- list(
+        timestamp = suppressWarnings(as.POSIXct(ts)),
+        agent_id = agent,
+        code = paste(code_lines, collapse = "\n"),
+        success = !grepl("(ERROR)", agent_line, fixed = TRUE),
+        has_plot = FALSE,
+        source_log = basename(f)
+      )
+    }
+  }
+  entries
+}
+
 #' Query agent execution history
 #'
 #' @param agent_filter "all", or a specific agent ID to filter by
 #' @param requesting_agent The agent making the request (for context)
 #' @param last_n Number of entries to return
+#' @param include_past Also parse prior session log files on disk, so the
+#'   audit trail survives R restarts
 #' @return Character string with formatted history
-
-query_agent_history <- function(agent_filter = "all", requesting_agent = NULL, last_n = 20) {
+query_agent_history <- function(agent_filter = "all", requesting_agent = NULL,
+                                last_n = 20, include_past = FALSE) {
   entries <- .claude_history_env$entries
 
+  if (isTRUE(include_past)) {
+    entries <- c(past_history_entries(), entries)
+  }
+
   if (length(entries) == 0) {
-    return("No execution history recorded yet.")
+    return(if (isTRUE(include_past)) {
+      "No execution history in memory and no past session logs found."
+    } else {
+      "No execution history recorded yet. Pass include_past = TRUE to search prior session logs on disk."
+    })
   }
 
   # Filter by agent if requested
@@ -1212,21 +1992,28 @@ query_agent_history <- function(agent_filter = "all", requesting_agent = NULL, l
   }
 
   if (length(entries) == 0) {
-    return(sprintf("No history found for agent '%s'.", agent_filter))
+    return(sprintf(
+      "No history found for agent '%s'.%s", agent_filter,
+      if (isTRUE(include_past)) "" else
+        " Pass include_past = TRUE to also search prior session logs."
+    ))
   }
 
   # Take last N
   if (length(entries) > last_n) {
-    entries <- tail(entries, last_n)
+    entries <- utils::tail(entries, last_n)
   }
 
   # Format output
   lines <- vapply(entries, function(e) {
     status <- if (e$success) "OK" else "ERR"
     plot_flag <- if (e$has_plot) " [plot]" else ""
+    src <- if (!is.null(e$source_log)) paste0(" {", e$source_log, "}") else ""
     code_preview <- substr(gsub("\n", " ", e$code), 1, 80)
-    sprintf("[%s] %s (%s%s): %s",
-            format(e$timestamp, "%H:%M:%S"), e$agent_id, status, plot_flag, code_preview)
+    ts_txt <- tryCatch(format(e$timestamp, "%Y-%m-%d %H:%M:%S"),
+                       error = function(err) as.character(e$timestamp))
+    sprintf("[%s] %s (%s%s)%s: %s",
+            ts_txt, e$agent_id, status, plot_flag, src, code_preview)
   }, character(1))
 
   paste(lines, collapse = "\n")
@@ -1278,10 +2065,25 @@ validate_code_security <- function(code) {
   return(list(blocked = FALSE))
 }
 
+# Append what a command printed, under the entry just written for it.
+# The "#> " prefix marks these lines as output rather than code, so replay,
+# history and notebook export skip them.
+log_output_to_file <- function(output, log_path, max_lines = 40L) {
+  if (length(output) == 0) return(invisible(NULL))
+  if (length(output) > max_lines) {
+    output <- c(output[seq_len(max_lines)],
+                sprintf("... %d more lines not logged", length(output) - max_lines))
+  }
+  entry <- paste0(paste0("#> ", output, collapse = "\n"), "\n\n")
+  tryCatch(cat(entry, file = log_path, append = TRUE), error = function(e) NULL)
+  invisible(NULL)
+}
+
 #' Log code to file
 #'
 #' @param code The R code to log
 #' @param log_path The path to the log file
+#' @param agent_id Optional agent identifier used to attribute the entry
 #' @return Invisible NULL
 
 log_code_to_file <- function(code, log_path, agent_id = NULL) {
@@ -1322,6 +2124,7 @@ log_code_to_file <- function(code, log_path, agent_id = NULL) {
 #' @param code The R code that caused the error
 #' @param error_message The error message
 #' @param log_path The path to the log file
+#' @param agent_id Optional agent identifier used to attribute the entry
 #' @return Invisible NULL
 
 log_error_to_file <- function(code, error_message, log_path, agent_id = NULL) {
@@ -1448,7 +2251,7 @@ export_log_as_script <- function(log_path = NULL, output_path = NULL, include_er
 
     # Extract code lines (skip the header comments)
     # Header lines: "# --- [timestamp] ---", "# Code executed by ...", "# Error: ..."
-    code_lines <- block[!grepl("^# --- \\[|^# Code executed by |^# Error: |^#\\s*$", block)]
+    code_lines <- block[!grepl("^# --- \\[|^# Code executed by |^# Run by |^# Error: |^#> |^#\\s*$", block)]
 
     # Remove trailing blank lines
     while (length(code_lines) > 0 && code_lines[length(code_lines)] == "") {
@@ -1633,8 +2436,15 @@ search_project_code_impl <- function(pattern, extensions = "R,Rmd,qmd",
       }
     )
     if (length(hits) == 0) next
-    rel_path <- sub(paste0("^", normalizePath(root_dir, mustWork = FALSE), "/?"), "",
-                    normalizePath(fpath, mustWork = FALSE))
+    # Prefix-strip without regex: normalizePath output can contain regex
+    # metacharacters (+, parens) that would corrupt or crash a sub() pattern
+    fp_norm <- normalizePath(fpath, mustWork = FALSE, winslash = "/")
+    root_norm <- normalizePath(root_dir, mustWork = FALSE, winslash = "/")
+    rel_path <- if (startsWith(fp_norm, root_norm)) {
+      sub("^/+", "", substring(fp_norm, nchar(root_norm) + 1L))
+    } else {
+      fp_norm
+    }
     for (ln in hits) {
       results <- c(results, sprintf("%s:%d: %s", rel_path, ln, trimws(lines[ln])))
       if (length(results) >= max_results) break
@@ -1655,8 +2465,12 @@ search_project_code_impl <- function(pattern, extensions = "R,Rmd,qmd",
 #'
 #' @param script_paths Character vector of script paths to source
 #' @param timeout Seconds before timing out (default 60)
+#' @param capture_output If TRUE, also capture and return the statistics the
+#'   script prints when run (visible top-level expressions included). This
+#'   makes the probe a clean-room evaluator: the output comes from a fresh
+#'   process, so stale objects in the main session can never contaminate it.
 #' @return Character string describing objects created by each script
-probe_scripts_impl <- function(script_paths, timeout = 60) {
+probe_scripts_impl <- function(script_paths, timeout = 60, capture_output = FALSE) {
   results <- character(0)
   for (sp in script_paths) {
     sp_expanded <- path.expand(sp)
@@ -1665,29 +2479,53 @@ probe_scripts_impl <- function(script_paths, timeout = 60) {
       next
     }
     probe_result <- tryCatch({
-      callr::r(function(script_path) {
+      callr::r(function(script_path, capture_output) {
+        # Audit-clean printing inside the clean room too
+        options(pillar.sigfig = 7, tibble.print_max = Inf, width = 200, digits = 7)
         env <- new.env(parent = globalenv())
-        tryCatch({
-          source(script_path, local = env)
+        printed <- character(0)
+        summary_txt <- tryCatch({
+          if (capture_output) {
+            printed <- utils::capture.output(
+              source(script_path, local = env, print.eval = TRUE)
+            )
+          } else {
+            source(script_path, local = env)
+          }
           obj_names <- ls(env)
-          if (length(obj_names) == 0) return("No objects created.")
-          info <- vapply(obj_names, function(nm) {
-            obj <- get(nm, envir = env)
-            cl <- paste(class(obj), collapse = "/")
-            dims <- if (is.data.frame(obj) || is.matrix(obj)) {
-              paste0(" [", nrow(obj), " x ", ncol(obj), "]")
-            } else if (is.vector(obj) && !is.list(obj)) {
-              paste0(" [length ", length(obj), "]")
-            } else {
-              ""
-            }
-            paste0(nm, " : ", cl, dims)
-          }, character(1))
-          paste(info, collapse = "\n")
+          if (length(obj_names) == 0) "No objects created."
+          else {
+            info <- vapply(obj_names, function(nm) {
+              obj <- get(nm, envir = env)
+              cl <- paste(class(obj), collapse = "/")
+              dims <- if (is.data.frame(obj) || is.matrix(obj)) {
+                paste0(" [", nrow(obj), " x ", ncol(obj), "]")
+              } else if (is.vector(obj) && !is.list(obj)) {
+                paste0(" [length ", length(obj), "]")
+              } else {
+                ""
+              }
+              paste0(nm, " : ", cl, dims)
+            }, character(1))
+            paste(info, collapse = "\n")
+          }
         }, error = function(e) {
           paste0("Error sourcing: ", e$message)
         })
-      }, args = list(script_path = sp_expanded),
+        if (capture_output && length(printed) > 0) {
+          if (length(printed) > 400) {
+            printed <- c(utils::head(printed, 320),
+                         sprintf("... [%d lines omitted] ...", length(printed) - 400L),
+                         utils::tail(printed, 80))
+          }
+          out_txt <- paste(printed, collapse = "\n")
+          if (nchar(out_txt) > 40000) {
+            out_txt <- paste0(substr(out_txt, 1, 40000), "\n... [output truncated]")
+          }
+          summary_txt <- paste0(summary_txt, "\n--- printed output ---\n", out_txt)
+        }
+        summary_txt
+      }, args = list(script_path = sp_expanded, capture_output = isTRUE(capture_output)),
          user_profile = FALSE, timeout = timeout)
     }, error = function(e) {
       paste0("callr error: ", e$message)
@@ -1710,13 +2548,15 @@ verify_references_impl <- function(file_path = NULL, text = NULL,
     return("Error: jsonlite package is required. Install with install.packages('jsonlite')")
   }
 
-  # Get text from file or direct input
+  # Get text from file or direct input. Manuscripts (.docx/.pdf) route
+  # through the structured extractor; a raw readLines() on a .docx returns
+  # zip bytes, which is how the Pass 4 line-range mode broke in the field.
   if (!is.null(file_path)) {
     file_path <- path.expand(file_path)
     if (!file.exists(file_path)) {
       return(paste0("Error: File not found: ", file_path))
     }
-    lines <- readLines(file_path, warn = FALSE)
+    lines <- read_as_text_lines(file_path)
     if (!is.null(start_line)) {
       end_l <- if (!is.null(end_line)) min(end_line, length(lines)) else length(lines)
       lines <- lines[max(1, start_line):end_l]
@@ -1726,17 +2566,49 @@ verify_references_impl <- function(file_path = NULL, text = NULL,
     return("Error: Either file_path or text must be provided")
   }
 
-  # Extract DOIs using regex
-  doi_pattern <- "10\\.\\d{4,9}/[^\\s,;\\]\\)>\"']+"
-  dois <- regmatches(text, gregexpr(doi_pattern, text, perl = TRUE))[[1]]
-  dois <- unique(trimws(dois))
-  dois <- sub("[\\.,;]+$", "", dois)
+  # Extract DOIs
+  dois <- extract_dois(text)
+  doi_pattern <- "10\\.\\d{4,9}/[-._;()/:a-zA-Z0-9]+"
 
-  if (length(dois) == 0) {
+  # Cap per call: each lookup blocks the R session, and the MCP bridge times
+  # out at 120s. Large bibliographies should be paged via start_line/end_line.
+  max_dois <- 50L
+  n_found <- length(dois)
+  cap_note <- ""
+  if (n_found > max_dois) {
+    dois <- dois[seq_len(max_dois)]
+    cap_note <- sprintf(
+      "NOTE: %d DOIs found; only the first %d were checked. Call again with start_line/end_line to cover the rest.\n",
+      n_found, max_dois
+    )
+  }
+
+  # Bound each CrossRef request; the default timeout (60s) can stack badly
+  old_timeout <- options(timeout = 10)
+  on.exit(options(old_timeout), add = TRUE)
+
+  # arXiv IDs (new-style NNNN.NNNNN). Checked against the arXiv API, with a
+  # published-version lookup so preprint citations of published work surface.
+  arxiv_pattern <- "arXiv[:. ]\\s*(\\d{4}\\.\\d{4,5})"
+  arxiv_ids <- unique(unlist(lapply(
+    regmatches(text, gregexpr(arxiv_pattern, text, perl = TRUE, ignore.case = TRUE)),
+    function(m) sub(arxiv_pattern, "\\1", m, perl = TRUE, ignore.case = TRUE)
+  )))
+  arxiv_ids <- utils::head(arxiv_ids[nzchar(arxiv_ids)], 10L)
+
+  # Reference entries with neither a DOI nor an arXiv ID: try bibliographic
+  # matching. Blocks are blank-line-separated chunks of plausible entry size.
+  blocks <- strsplit(text, "\n\\s*\n")[[1]]
+  nodoi_refs <- utils::head(Filter(function(b) {
+    flat <- trimws(gsub("\\s+", " ", b))
+    nchar(flat) >= 50 && nchar(flat) <= 600 &&
+      !grepl(doi_pattern, b, perl = TRUE) &&
+      !grepl(arxiv_pattern, b, perl = TRUE, ignore.case = TRUE)
+  }, blocks), 15L)
+
+  if (length(dois) == 0 && length(arxiv_ids) == 0 && length(nodoi_refs) == 0) {
     return(paste0(
-      "No DOIs found in the specified text.\n",
-      "The references in this section do not contain DOIs, or DOIs are not ",
-      "in standard format (10.XXXX/...).\n",
+      "No DOIs, arXiv IDs, or matchable reference entries found in the specified text.\n",
       "To verify these references, use web search to check each one manually."
     ))
   }
@@ -1746,8 +2618,16 @@ verify_references_impl <- function(file_path = NULL, text = NULL,
   for (i in seq_along(dois)) {
     doi <- dois[i]
     results[[i]] <- tryCatch({
-      api_url <- paste0("https://api.crossref.org/works/", URLencode(doi, reserved = TRUE))
-      raw <- jsonlite::fromJSON(api_url)
+      api_url <- paste0("https://api.crossref.org/works/", utils::URLencode(doi, reserved = TRUE))
+      # Retry transient failures (429 rate limits, hiccups); a 404 is a real
+      # answer (unregistered DOI) and is surfaced immediately.
+      raw <- NULL
+      for (attempt in 1:3) {
+        raw <- tryCatch(jsonlite::fromJSON(api_url), error = function(e) e)
+        if (!inherits(raw, "error") || grepl("404", conditionMessage(raw))) break
+        Sys.sleep(c(1.5, 5)[min(attempt, 2)])
+      }
+      if (inherits(raw, "error")) stop(raw)
       msg <- raw$message
 
       title <- if (!is.null(msg$title)) paste(msg$title, collapse = " ") else "N/A"
@@ -1776,6 +2656,8 @@ verify_references_impl <- function(file_path = NULL, text = NULL,
 
       doi_url <- if (!is.null(msg$URL)) msg$URL else paste0("https://doi.org/", doi)
 
+      retraction_flag <- check_retraction_impl(doi)
+
       paste0(
         "DOI: ", doi, "\n",
         "Status: FOUND\n",
@@ -1783,7 +2665,8 @@ verify_references_impl <- function(file_path = NULL, text = NULL,
         "CrossRef Authors: ", authors, "\n",
         "CrossRef Year: ", year, "\n",
         "CrossRef Journal: ", journal, "\n",
-        "CrossRef URL: ", doi_url
+        "CrossRef URL: ", doi_url,
+        if (!is.null(retraction_flag)) paste0("\n", retraction_flag) else ""
       )
     }, error = function(e) {
       if (grepl("404", e$message)) {
@@ -1795,24 +2678,68 @@ verify_references_impl <- function(file_path = NULL, text = NULL,
     })
 
     # Polite rate limiting
-    if (i < length(dois)) Sys.sleep(0.1)
+    if (i < length(dois)) Sys.sleep(0.25)
+  }
+
+  # arXiv lookups (with published-version check)
+  arxiv_section <- ""
+  if (length(arxiv_ids) > 0) {
+    arxiv_results <- character(0)
+    for (aid in arxiv_ids) {
+      r <- check_arxiv_impl(aid)
+      if (!is.null(r)) arxiv_results <- c(arxiv_results, r)
+      Sys.sleep(0.25)
+    }
+    if (length(arxiv_results) > 0) {
+      arxiv_section <- paste0(
+        "\n\n=== ARXIV PREPRINTS (", length(arxiv_ids), ") ===\n\n",
+        paste(arxiv_results, collapse = "\n\n")
+      )
+    }
+  }
+
+  # Bibliographic matching for DOI-less entries
+  nodoi_section <- ""
+  if (length(nodoi_refs) > 0) {
+    nodoi_results <- character(0)
+    for (ref in nodoi_refs) {
+      flat <- trimws(gsub("\\s+", " ", ref))
+      m <- match_reference_impl(flat)
+      nodoi_results <- c(nodoi_results, paste0(
+        "Reference: ", substr(flat, 1, 140), if (nchar(flat) > 140) "..." else "", "\n",
+        if (!is.null(m)) m else "No plausible Crossref match; verify manually via web search."
+      ))
+      Sys.sleep(0.25)
+    }
+    nodoi_section <- paste0(
+      "\n\n=== ENTRIES WITHOUT DOIs (", length(nodoi_refs), ", bibliographic matching) ===\n\n",
+      paste(nodoi_results, collapse = "\n\n")
+    )
   }
 
   paste0(
     "=== REFERENCE VERIFICATION REPORT ===\n",
-    "DOIs found: ", length(dois), "\n",
+    cap_note,
+    "DOIs found: ", n_found, "\n",
     "---\n\n",
     paste(results, collapse = "\n\n---\n\n"),
+    arxiv_section,
+    nodoi_section,
     "\n\n---\n",
     "Compare CrossRef metadata against manuscript claims.\n",
-    "References without DOIs require verification via web search."
+    "Retraction/correction flags come from Crossref update notices.\n",
+    "Bibliographic matches are candidates, not confirmations: verify title and authors before accepting.\n",
+    "Anything still unmatched requires manual web search."
   )
 }
 
 #' Extract text lines from a manuscript file
 #'
-#' Reads a manuscript file and returns its text as a character vector of lines.
-#' Supports .docx (via the officer package), .qmd, .Rmd, .tex, .txt, and other
+#' Reads a manuscript file and returns its text as a character vector of lines
+#' with structure preserved: headings are prefixed with `#` marks, and table
+#' cells are emitted row-wise as `[Table k, row j] cell | cell | cell` so
+#' adjacent numeric cells can never concatenate. Supports .docx (via the
+#' officer package), .pdf (via pdftools), .qmd, .Rmd, .tex, .txt, and other
 #' plain text formats.
 #'
 #' @param file_path Path to the manuscript file
@@ -1830,8 +2757,67 @@ extract_manuscript_text <- function(file_path) {
     }
     doc <- officer::read_docx(file_path)
     content <- officer::docx_summary(doc)
-    paragraphs <- content[content$content_type == "paragraph", "text"]
-    return(paragraphs)
+
+    # Walk the document in order, emitting paragraphs, headings, and table
+    # cells. Table cells get explicit row-wise separators so numbers from
+    # adjacent cells can never concatenate into garbage tokens -- and so the
+    # audit actually sees table content at all (the old implementation kept
+    # only paragraphs and silently dropped every table).
+    out <- character(0)
+    table_counter <- 0L
+    content <- content[order(content$doc_index), , drop = FALSE]
+    is_cell <- content$content_type == "table cell"
+    runs <- rle(is_cell)
+    seg_end <- cumsum(runs$lengths)
+    seg_start <- c(1L, utils::head(seg_end, -1L) + 1L)
+
+    emit_table <- function(cells) {
+      table_counter <<- table_counter + 1L
+      for (r in sort(unique(cells$row_id))) {
+        rcells <- cells[cells$row_id == r, , drop = FALSE]
+        rcells <- rcells[order(rcells$cell_id), , drop = FALSE]
+        vals <- rcells$text
+        vals[is.na(vals)] <- ""
+        is_hdr <- isTRUE(any(rcells$is_header))
+        out <<- c(out, sprintf(
+          "[Table %d, %s] %s",
+          table_counter,
+          if (is_hdr) "header" else paste0("row ", r),
+          paste(vals, collapse = " | ")
+        ))
+      }
+      out <<- c(out, "")
+    }
+
+    for (seg in seq_along(runs$values)) {
+      seg_rows <- content[seg_start[seg]:seg_end[seg], , drop = FALSE]
+      if (!runs$values[seg]) {
+        # Paragraph segment: emit each paragraph, marking headings
+        for (k in seq_len(nrow(seg_rows))) {
+          txt <- seg_rows$text[k]
+          if (is.na(txt)) txt <- ""
+          style <- seg_rows$style_name[k]
+          if (!is.na(style) && grepl("heading", style, ignore.case = TRUE)) {
+            lvl <- suppressWarnings(as.integer(gsub("\\D", "", style)))
+            if (is.na(lvl) || lvl < 1) lvl <- 1L
+            txt <- paste0(strrep("#", min(lvl, 6L)), " ", txt)
+          }
+          out <- c(out, txt)
+        }
+      } else {
+        # Table segment. Adjacent tables with no paragraph between them
+        # arrive as one run; a row_id that resets below its predecessor
+        # marks the boundary.
+        breaks <- which(diff(seg_rows$row_id) < 0 &
+                          seg_rows$cell_id[-1] <= seg_rows$cell_id[-nrow(seg_rows)])
+        starts <- c(1L, breaks + 1L)
+        ends <- c(breaks, nrow(seg_rows))
+        for (t in seq_along(starts)) {
+          emit_table(seg_rows[starts[t]:ends[t], , drop = FALSE])
+        }
+      }
+    }
+    return(out)
   } else if (ext == "pdf") {
     if (!requireNamespace("pdftools", quietly = TRUE)) {
       stop("The 'pdftools' package is required to read .pdf files. Install with: install.packages('pdftools')")
@@ -1844,14 +2830,6 @@ extract_manuscript_text <- function(file_path) {
   }
 }
 
-#' Print the Reviewer Zero prompt template
-#'
-#' Displays the built-in Reviewer Zero academic auditing protocol.
-#' This prompt guides an AI assistant through a 4-pass verification of
-#' quantitative claims in a manuscript against source code.
-#'
-#' @return The prompt text (invisibly), printed to the console.
-#' @export
 #' Print the Data Annotation prompt template
 #'
 #' Displays the built-in protocol for AI-driven CSV data annotation using
@@ -1869,14 +2847,251 @@ data_annotation_prompt <- function() {
   invisible(txt)
 }
 
-reviewer_zero_prompt <- function() {
+#' Print the Reviewer Zero prompt template
+#'
+#' Displays the built-in Reviewer Zero academic auditing protocol.
+#' This prompt guides an AI assistant through a 4-pass verification of
+#' quantitative claims in a manuscript against source code, with two
+#' optional extension passes.
+#'
+#' @param prereg_path Optional path to a preregistration file (.docx, .pdf,
+#'   .qmd, .md, or plain text). When supplied, a Pass 5 is appended that
+#'   audits the executed analysis against the preregistered plan and
+#'   produces a deviation report (followed / disclosed deviation /
+#'   undisclosed deviation / not executed), plus a list of unlabelled
+#'   exploratory additions.
+#' @param robustness Logical. When TRUE, a Pass 6 is appended that runs a
+#'   specification-curve robustness check on the manuscript's primary
+#'   claims: the agent enumerates defensible alternative analysis choices,
+#'   fans the grid out through background jobs, and reports a sensitivity
+#'   table and specification curve.
+#' @param writeback Logical. When TRUE (and the manuscript is a .docx), a
+#'   final step is appended: every flagged claim is written back into the
+#'   manuscript as a native Word comment via [annotate_manuscript()], so
+#'   findings can be accepted or dismissed in Word. The annotated copy is
+#'   written alongside the original, which is never modified.
+#' @param referee Logical. When TRUE, Referee Mode is appended: a
+#'   substantive review of the manuscript's reasoning. Five content-only
+#'   lenses (logic, methods, internal consistency, evidence presentation,
+#'   framing) run as parallel subagents where the host CLI supports them, a
+#'   deterministic cross-reference check runs alongside, every finding is
+#'   anchor-verified against the text, and confirmed findings are written
+#'   into the .docx as Word comments. Also available standalone via
+#'   [referee_prompt()].
+#' @return The prompt text (invisibly), printed to the console.
+#' @export
+reviewer_zero_prompt <- function(prereg_path = NULL, robustness = FALSE,
+                                 writeback = FALSE, referee = FALSE) {
   prompt_path <- system.file("prompts", "reviewer_zero.md", package = "ClaudeR")
   if (!nzchar(prompt_path) || !file.exists(prompt_path)) {
     stop("Reviewer Zero prompt template not found. Is ClaudeR installed correctly?")
   }
   txt <- paste(readLines(prompt_path, warn = FALSE), collapse = "\n")
-  cat(txt, "\n")
+
+  if (!is.null(prereg_path)) {
+    prereg_path <- path.expand(prereg_path)
+    if (!file.exists(prereg_path)) {
+      stop("Preregistration file not found: ", prereg_path, call. = FALSE)
+    }
+    ext_path <- system.file("prompts", "reviewer_zero_prereg.md", package = "ClaudeR")
+    ext <- paste(readLines(ext_path, warn = FALSE), collapse = "\n")
+    ext <- gsub("{{PREREG_PATH}}", prereg_path, ext, fixed = TRUE)
+    txt <- paste0(txt, "\n", ext)
+  }
+
+  if (isTRUE(robustness)) {
+    ext_path <- system.file("prompts", "reviewer_zero_robustness.md", package = "ClaudeR")
+    ext <- paste(readLines(ext_path, warn = FALSE), collapse = "\n")
+    txt <- paste0(txt, "\n", ext)
+  }
+
+  if (isTRUE(writeback)) {
+    ext_path <- system.file("prompts", "reviewer_zero_writeback.md", package = "ClaudeR")
+    ext <- paste(readLines(ext_path, warn = FALSE), collapse = "\n")
+    txt <- paste0(txt, "\n", ext)
+  }
+
+  if (isTRUE(referee)) {
+    txt <- paste0(txt, "\n", build_referee_text())
+  }
+
+  cat_protocol(txt)
   invisible(txt)
+}
+
+# Build the Referee Mode protocol text with a concrete run configuration.
+# Shared by referee_prompt() and reviewer_zero_prompt(referee = TRUE).
+build_referee_text <- function(lenses = c("logic", "methods", "consistency",
+                                          "evidence", "framing"),
+                               reviewers_per_lens = 1L,
+                               model = NULL,
+                               cross_vendor = FALSE,
+                               stance = c("balanced", "reviewer2")) {
+  stance <- match.arg(stance)
+  valid <- c("logic", "methods", "consistency", "evidence", "framing")
+  bad <- setdiff(lenses, valid)
+  if (length(bad) > 0) {
+    stop(sprintf("Unknown lens(es): %s. Valid: %s.",
+                 paste(bad, collapse = ", "), paste(valid, collapse = ", ")),
+         call. = FALSE)
+  }
+  if (!is.numeric(reviewers_per_lens) || reviewers_per_lens < 1 ||
+      reviewers_per_lens > 3) {
+    stop("`reviewers_per_lens` must be 1, 2, or 3 (stances: balanced; prosecutor+verifier; +backwards reader).",
+         call. = FALSE)
+  }
+  reviewers_per_lens <- as.integer(reviewers_per_lens)
+
+  model_directive <- if (is.null(model)) {
+    paste0("inherit the session's model for every reviewer subagent. If the ",
+           "user asked for a quick pass, prefer a fast tier (e.g. haiku or ",
+           "sonnet); for a submission-grade review, prefer the strongest ",
+           "tier available (e.g. opus or fable).")
+  } else if (is.null(names(model)) && length(model) == 1) {
+    sprintf(paste0("pass model = \"%s\" when dispatching EVERY reviewer ",
+                   "subagent (the Task tool's model parameter on Claude ",
+                   "Code, or your host's equivalent)."), model)
+  } else {
+    if (is.null(names(model)) || any(!nzchar(names(model)))) {
+      stop("`model` must be a single tier or a fully named vector, e.g. c(logic = \"opus\", consistency = \"haiku\").",
+           call. = FALSE)
+    }
+    bad_names <- setdiff(names(model), valid)
+    if (length(bad_names) > 0) {
+      stop(sprintf("`model` names must be lenses. Unknown: %s.",
+                   paste(bad_names, collapse = ", ")), call. = FALSE)
+    }
+    paste0("per-lens models: ",
+           paste(sprintf("%s -> \"%s\"", names(model), model), collapse = "; "),
+           "; lenses not listed inherit the session's model.")
+  }
+
+  vendor_directive <- if (isTRUE(cross_vendor)) {
+    paste0(
+      "ENABLED. Where another vendor's CLI is installed (check with ",
+      "`which codex agy qwen` from Bash), dispatch at least one reviewer of ",
+      "the logic and methods lenses to a DIFFERENT model vendor as a ",
+      "one-shot subprocess: `codex exec` (pipe the reviewer prompt via ",
+      "stdin; flags: --skip-git-repo-check -c mcp_servers={}), ",
+      "`agy -p \"<prompt>\"`, or `qwen --prompt \"<prompt>\"`. First write ",
+      "the extracted manuscript to a plain-text file ",
+      "(writeLines(doc_lines, \"ms_extract.txt\")) and reference that path ",
+      "in the prompt, along with the lens mandate, stance, and the finding ",
+      "format. Cross-vendor findings enter the same registry and the same ",
+      "adjudication. Agreement across vendors is strong corroboration; ",
+      "vendor-unique findings deserve scrutiny in both directions. If no ",
+      "other vendor CLI is available, record that in the report and proceed ",
+      "single-vendor. Same-model reviewers share blind spots; a second ",
+      "vendor is the strongest decorrelation available."
+    )
+  } else {
+    "disabled for this run: all reviewers run as host-native subagents."
+  }
+
+  prompt_path <- system.file("prompts", "reviewer_zero_referee.md", package = "ClaudeR")
+  if (!nzchar(prompt_path) || !file.exists(prompt_path)) {
+    stop("Referee prompt template not found. Is ClaudeR installed correctly?")
+  }
+  txt <- paste(readLines(prompt_path, warn = FALSE), collapse = "\n")
+  stance_block <- if (identical(stance, "reviewer2")) {
+    paste0(
+      "\nStance for this run: HOSTILE BUT FAIR REVIEWER 2.\n\n",
+      "### Step R0: Unprimed read (FIRST, before any lens work)\n\n",
+      "Before applying any lens or reading any registry, give your unprimed\n",
+      "read in exactly three sentences: what is the paper's central claim,\n",
+      "and would you accept it at a strong venue as it stands? Record these\n",
+      "three sentences in the report verbatim, written before any detailed\n",
+      "finding exists, so the gestalt judgment is not contaminated by the\n",
+      "defect hunt that follows.\n\n",
+      "Tone for all comments: direct, skeptical, and unsparing about\n",
+      "weaknesses, while remaining scrupulously fair. Every criticism is\n",
+      "anchored and defensible; no sneering; genuine strengths are\n",
+      "acknowledged where they bear on the accept judgment. Rank the final\n",
+      "findings by severity, and tag each with the study it concerns.\n"
+    )
+  } else ""
+
+  severity_scale <- if (identical(stance, "reviewer2")) {
+    paste0("`fatal` (invalidates a central claim; sinks the paper at a strong\n",
+           "  venue) / `must-fix` (blocks acceptance until addressed) /\n",
+           "  `minor` (substantive but small)")
+  } else {
+    paste0("`major` (undermines a conclusion) / `moderate` (weakens or\n",
+           "  confuses an argument) / `minor` (substantive but small)")
+  }
+
+  txt <- gsub("{{LENSES}}", paste(lenses, collapse = ", "), txt, fixed = TRUE)
+  txt <- gsub("{{REVIEWERS_PER_LENS}}", as.character(reviewers_per_lens), txt, fixed = TRUE)
+  txt <- gsub("{{MODEL_DIRECTIVE}}", model_directive, txt, fixed = TRUE)
+  txt <- gsub("{{VENDOR_DIRECTIVE}}", vendor_directive, txt, fixed = TRUE)
+  txt <- gsub("{{STANCE_BLOCK}}", stance_block, txt, fixed = TRUE)
+  txt <- gsub("{{SEVERITY_SCALE}}", severity_scale, txt, fixed = TRUE)
+  txt
+}
+
+#' Print the Referee Mode prompt (standalone)
+#'
+#' Referee Mode is a substantive review of a manuscript's reasoning:
+#' argument logic, methods, internal consistency, evidence presentation,
+#' and framing, plus a deterministic cross-reference check. Findings are
+#' anchor-verified against the text and delivered as Word comments in the
+#' manuscript itself. This prints the protocol standalone, without the
+#' numeric audit passes; to run it after a full audit, use
+#' `reviewer_zero_prompt(referee = TRUE)`.
+#'
+#' @param lenses Which review lenses to run. Any subset of
+#'   `c("logic", "methods", "consistency", "evidence", "framing")`.
+#' @param reviewers_per_lens 1, 2, or 3 independent reviewers per lens.
+#'   With 2, each lens gets a prosecutor (hunts flaws) and a verifier
+#'   (confirms each step); with 3, a backwards reader is added. Opposed
+#'   stances decorrelate reviewers built on the same model.
+#' @param model Optional model directive for reviewer subagents. A single
+#'   tier applies to all lenses (e.g. `"haiku"` for a quick pass,
+#'   `"opus"` for a submission-grade review); a named vector sets tiers
+#'   per lens, e.g. `c(logic = "opus", consistency = "haiku")`. The
+#'   orchestrating agent passes this to its subagent dispatch (Claude
+#'   Code's Task tool `model` parameter). Default: inherit the session's
+#'   model.
+#' @param cross_vendor If TRUE, the protocol instructs the orchestrator to
+#'   dispatch at least one logic and one methods reviewer to a different
+#'   model vendor (codex/agy/qwen one-shot CLI calls) where installed.
+#'   Cross-vendor agreement is the strongest available guard against
+#'   same-model blind spots.
+#' @param stance `"balanced"` (default) or `"reviewer2"`. Reviewer 2 is a
+#'   hostile-but-fair journal reviewer: the run opens with an unprimed read
+#'   (three sentences: the paper's central claim, and would it be accepted
+#'   at a strong venue) recorded before any lens work, findings use a
+#'   fatal / must-fix / minor severity scale, and every finding is tagged
+#'   with the study it concerns.
+#' @return The prompt text (invisibly), printed to the console.
+#' @export
+referee_prompt <- function(lenses = c("logic", "methods", "consistency",
+                                      "evidence", "framing"),
+                           reviewers_per_lens = 1L,
+                           model = NULL,
+                           cross_vendor = FALSE,
+                           stance = c("balanced", "reviewer2")) {
+  txt <- build_referee_text(lenses = lenses,
+                            reviewers_per_lens = reviewers_per_lens,
+                            model = model, cross_vendor = cross_vendor,
+                            stance = stance)
+  cat_protocol(txt)
+  invisible(txt)
+}
+
+# Print a protocol, but write the composed text to a file first and announce
+# the path. Long protocols exceed the console-output cap (agents saw "262
+# lines elided" mid-protocol in the field); the file makes the full text one
+# read_file call away.
+cat_protocol <- function(txt) {
+  proto_file <- tempfile(pattern = "clauder_protocol_", fileext = ".md")
+  ok <- tryCatch({ writeLines(txt, proto_file); TRUE }, error = function(e) FALSE)
+  if (ok) {
+    cat("[Full protocol saved to:", proto_file,
+        "-- if this printout is truncated, read that file completely before starting.]\n\n")
+  }
+  cat(txt, "\n")
+  invisible(NULL)
 }
 
 #' Print the R Best Practices prompt template
@@ -1914,6 +3129,343 @@ multi_agent_prompt <- function() {
   invisible(txt)
 }
 
+#' Validate that an assembly review round is structurally complete
+#'
+#' Deterministic check the orchestrator must call at the end of each assembly
+#' round before declaring it resolved. Throws an informative R-level error on
+#' any structural failure: missing voters, missing re-verification sections in
+#' Round 2+, forbidden patterns (e.g. self-simulated votes), or unrecognized
+#' verdicts. Returns invisibly on success so the orchestrator can confirm
+#' which checks passed.
+#'
+#' This is intentionally a hard gate. Soft "you should reject..." rules in the
+#' protocol are not reliably followed by orchestrator agents; an R function
+#' that errors loudly is.
+#'
+#' @param lab_folder Absolute path to the lab folder
+#' @param round_n Integer round number to validate (1, 2, ...)
+#' @param expected_roles Character vector of roles that should have voted in
+#'   this round. Default is the four Phase-1 working roles.
+#' @return Invisibly returns a list with `valid = TRUE`, the voted roles, and
+#'   the verdicts seen for the round.
+#' @export
+validate_assembly_round <- function(lab_folder,
+                                     round_n,
+                                     expected_roles = c("eda", "modeling", "reviewer_zero", "reporting")) {
+  if (missing(lab_folder) || !nzchar(lab_folder)) {
+    stop("`lab_folder` is required.", call. = FALSE)
+  }
+  if (!dir.exists(lab_folder)) {
+    stop(sprintf("Lab folder not found: %s", lab_folder), call. = FALSE)
+  }
+  if (!is.numeric(round_n) || round_n < 1) {
+    stop("`round_n` must be a positive integer.", call. = FALSE)
+  }
+  round_n <- as.integer(round_n)
+
+  log_path <- file.path(lab_folder, "assembly_log.md")
+  if (!file.exists(log_path)) {
+    stop(sprintf("assembly_log.md not found in lab folder: %s", log_path), call. = FALSE)
+  }
+
+  log_text <- paste(readLines(log_path, warn = FALSE), collapse = "\n")
+
+  # Forbidden pattern: simulated votes. Only flag lines mentioning both
+  # "simulat*" and "vote" -- a bare "simulat" match would reject legitimate
+  # analysis discussion (Monte Carlo simulations, simulation studies).
+  log_lines <- strsplit(log_text, "\n", fixed = TRUE)[[1]]
+  sim_vote <- grepl("simulat", log_lines, ignore.case = TRUE) &
+    grepl("vote", log_lines, ignore.case = TRUE)
+  if (any(sim_vote)) {
+    stop(sprintf(
+      "assembly_log.md appears to contain a simulated vote (line %d: '%s'). Self-simulated votes are forbidden (see protocol section 3.4).",
+      which(sim_vote)[1], trimws(log_lines[which(sim_vote)[1]])
+    ), call. = FALSE)
+  }
+
+  # Isolate the section for round_n.
+  round_pattern <- sprintf("## Round %d\\b", round_n)
+  if (!grepl(round_pattern, log_text)) {
+    stop(sprintf("Round %d section not found in assembly_log.md.", round_n), call. = FALSE)
+  }
+  # Get everything from "## Round N" to the next "## Round" or end of file.
+  section_start <- regexpr(round_pattern, log_text)
+  section_text <- substring(log_text, section_start)
+  next_round_match <- regexpr(sprintf("## Round %d\\b", round_n + 1L), section_text)
+  if (next_round_match > 0) {
+    section_text <- substring(section_text, 1, next_round_match - 1L)
+  }
+
+  # Pull every "### Vote <separator> <role>" header. The protocol shows a
+  # middle-dot separator but agents may render it differently; match any short
+  # non-alphanumeric run between "Vote" and the role name.
+  vote_matches <- regmatches(section_text, gregexpr("### Vote[^A-Za-z0-9\n]+([A-Za-z0-9_-]+)", section_text))[[1]]
+  found_roles <- sub("^### Vote[^A-Za-z0-9\n]+", "", vote_matches)
+  found_roles <- unique(found_roles)
+  missing_roles <- setdiff(expected_roles, found_roles)
+  if (length(missing_roles) > 0) {
+    stop(sprintf(
+      "Round %d is missing votes from these expected roles: %s. Every dispatched voter must have a row (APPROVE / CONCERNS / UNAVAILABLE). Silent absence is forbidden.",
+      round_n, paste(missing_roles, collapse = ", ")
+    ), call. = FALSE)
+  }
+
+  # Pull every Verdict line and validate the values.
+  verdict_matches <- regmatches(section_text, gregexpr("\\*\\*Verdict:\\*\\*\\s*([A-Z]+)", section_text))[[1]]
+  verdicts <- sub("\\*\\*Verdict:\\*\\*\\s*", "", verdict_matches)
+  if (length(verdicts) < length(expected_roles)) {
+    stop(sprintf(
+      "Round %d has %d Verdict rows but expected at least %d (one per role).",
+      round_n, length(verdicts), length(expected_roles)
+    ), call. = FALSE)
+  }
+  valid_verdicts <- c("APPROVE", "CONCERNS", "UNAVAILABLE")
+  bad <- setdiff(verdicts, valid_verdicts)
+  if (length(bad) > 0) {
+    stop(sprintf(
+      "Round %d has unrecognized verdicts: %s. Allowed values: %s.",
+      round_n, paste(bad, collapse = ", "), paste(valid_verdicts, collapse = ", ")
+    ), call. = FALSE)
+  }
+
+  # For Round 2+, every APPROVE vote must contain a Re-verification section.
+  if (round_n >= 2L && any(verdicts == "APPROVE")) {
+    # Split section_text into per-vote chunks at each "### Vote " heading.
+    # (?s) lets .*? cross newlines -- without it the pattern matches nothing
+    # on real multi-line vote blocks and this gate silently never fires.
+    vote_chunk_pattern <- "(?s)### Vote[^A-Za-z0-9\n]+[^\n]*\n.*?(?=### Vote|\\Z)"
+    vote_chunks <- regmatches(section_text, gregexpr(vote_chunk_pattern, section_text, perl = TRUE))[[1]]
+    if (length(vote_chunks) == 0) {
+      stop(sprintf(
+        "Round %d: could not parse any vote sections for re-verification checking. The log's vote format may be malformed.",
+        round_n
+      ), call. = FALSE)
+    }
+    for (chunk in vote_chunks) {
+      if (grepl("\\*\\*Verdict:\\*\\*\\s*APPROVE", chunk)) {
+        if (!grepl("Re-verification of my Round", chunk)) {
+          stop(sprintf(
+            "Round %d has an APPROVE vote without a 'Re-verification of my Round N-1 concerns' section. Round 2+ APPROVE votes MUST include this section. Reject the vote and ask the voter to redo it.",
+            round_n
+          ), call. = FALSE)
+        }
+      }
+    }
+  }
+
+  invisible(list(
+    valid = TRUE,
+    round = round_n,
+    voted_roles = found_roles,
+    verdicts = verdicts
+  ))
+}
+
+#' Finalize a Lab Mode session -- hard gate before delivery
+#'
+#' Runs the full termination-invariant check and, on success, writes a
+#' `lab_session_locked.json` file inside the lab folder. The protocol requires
+#' the orchestrator to call this function before Phase 4 and reach success.
+#' The lock file is the deterministic completion signal -- the user can verify
+#' in one line whether the session was properly finalized.
+#'
+#' Throws an R-level error on any failure, with a specific message identifying
+#' what's wrong.
+#'
+#' @param lab_folder Absolute path to the lab folder
+#' @param expected_roles Character vector of roles expected in the final round
+#' @param allow_override Logical. If TRUE, allows finalization even if the
+#'   final round has CONCERNS or UNAVAILABLE -- but the user must have signaled
+#'   override (the function writes the lock file with `override = TRUE` so the
+#'   user can audit). Default FALSE.
+#' @return Invisibly returns the contents of the written lock file.
+#' @export
+finalize_lab_session <- function(lab_folder,
+                                  expected_roles = c("eda", "modeling", "reviewer_zero", "reporting"),
+                                  allow_override = FALSE) {
+  if (missing(lab_folder) || !nzchar(lab_folder)) {
+    stop("`lab_folder` is required.", call. = FALSE)
+  }
+  if (!dir.exists(lab_folder)) {
+    stop(sprintf("Lab folder not found: %s", lab_folder), call. = FALSE)
+  }
+
+  # All required artifacts must exist before delivery.
+  required <- c("ledger.md", "analysis_final.R", "validator_report.md", "assembly_log.md")
+  missing_files <- required[!file.exists(file.path(lab_folder, required))]
+  if (length(missing_files) > 0) {
+    stop(sprintf(
+      "Lab folder missing required artifacts: %s. The session cannot be finalized.",
+      paste(missing_files, collapse = ", ")
+    ), call. = FALSE)
+  }
+  writeup_files <- list.files(lab_folder, pattern = "^final_writeup\\.(md|qmd)$", full.names = FALSE)
+  if (length(writeup_files) == 0) {
+    stop("Lab folder has no final_writeup.md or final_writeup.qmd. The session cannot be finalized.",
+         call. = FALSE)
+  }
+
+  # Identify the final round in assembly_log.md.
+  log_text <- paste(readLines(file.path(lab_folder, "assembly_log.md"), warn = FALSE), collapse = "\n")
+  fin_lines <- strsplit(log_text, "\n", fixed = TRUE)[[1]]
+  fin_sim <- grepl("simulat", fin_lines, ignore.case = TRUE) &
+    grepl("vote", fin_lines, ignore.case = TRUE)
+  if (any(fin_sim)) {
+    stop("assembly_log.md appears to contain a simulated vote. Self-simulated votes are forbidden.", call. = FALSE)
+  }
+  round_headers <- regmatches(
+    log_text,
+    gregexpr("## Round (\\d+)", log_text)
+  )[[1]]
+  round_numbers <- as.integer(sub("## Round ", "", round_headers, fixed = TRUE))
+  if (length(round_numbers) == 0) {
+    stop("assembly_log.md has no Round sections. Cannot identify a final round.", call. = FALSE)
+  }
+  final_round <- max(round_numbers)
+
+  # Per-round structural check on the final round.
+  per_round <- validate_assembly_round(lab_folder, final_round, expected_roles)
+
+  # The final round must be unanimous APPROVE with zero UNAVAILABLE
+  # -- unless the caller passed allow_override = TRUE.
+  unanimous_approve <- all(per_round$verdicts == "APPROVE")
+  if (!unanimous_approve && !isTRUE(allow_override)) {
+    bad <- per_round$verdicts[per_round$verdicts != "APPROVE"]
+    stop(sprintf(
+      "Final round (Round %d) is not unanimous APPROVE -- saw verdicts: %s. The session cannot be finalized without either resolving these or passing allow_override = TRUE.",
+      final_round, paste(bad, collapse = ", ")
+    ), call. = FALSE)
+  }
+
+  result <- list(
+    complete = TRUE,
+    override = isTRUE(allow_override) && !unanimous_approve,
+    lab_folder = normalizePath(lab_folder, mustWork = FALSE),
+    final_round = final_round,
+    voted_roles = per_round$voted_roles,
+    verdicts = per_round$verdicts,
+    writeup_file = writeup_files[1],
+    validated_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+  )
+
+  lock_path <- file.path(lab_folder, "lab_session_locked.json")
+  jsonlite::write_json(result, lock_path, auto_unbox = TRUE, pretty = TRUE)
+
+  message(sprintf("Lab session finalized. Lock file written to %s", lock_path))
+  invisible(result)
+}
+
+#' Print the Lab Mode orchestration protocol
+#'
+#' Displays the built-in multi-agent research lab protocol. An orchestrator
+#' agent reads this protocol and dispatches specialist subagents (EDA,
+#' modeling, reviewer_zero, reporting) through parallel exploration, sequential
+#' synthesis, and an assembly review until the final deliverables are
+#' pristine. Maintains a markdown ledger of findings, snapshots every assembly
+#' round to disk, and produces a self-contained timestamped lab folder.
+#'
+#' Agent-agnostic: works on any host CLI with subagent primitives (Claude Code
+#' Task tool, Codex `[agents]`, Gemini CLI `/subagents`, Antigravity
+#' `invoke_subagent`). Falls back to sequential role-playing on single-agent
+#' CLIs.
+#'
+#' @param description Required. A research question or task statement. The
+#'   orchestrator will refuse to proceed if this is empty or too vague.
+#' @param roles Character vector of roles to dispatch in the parallel
+#'   exploration phase. Default: all four. Must be a subset of
+#'   `c("eda", "modeling", "reviewer_zero", "reporting")`.
+#' @param session_name Name of the RStudio session to connect to. Default
+#'   `"default"`. Use `list_sessions` to see what's available.
+#' @param project_dir Working directory where the lab folder will be created.
+#'   Default `"."`.
+#' @param output_subdir Subdirectory of `project_dir` that will contain the
+#'   timestamped lab folder. Default `"clauder_lab"`. Each invocation produces
+#'   a new timestamped subfolder so prior runs are never overwritten.
+#' @param max_assembly_rounds Maximum assembly review rounds before
+#'   escalating to the user. Default 3.
+#'
+#' @return The prompt text (invisibly), printed to the console.
+#' @export
+#' @examples
+#' \dontrun{
+#' ClaudeR::lab_mode_prompt(
+#'   description = "Does driving behavior moderate the relationship between
+#'                  horsepower and fuel economy in mtcars?",
+#'   session_name = "study_01"
+#' )
+#' }
+lab_mode_prompt <- function(description,
+                            roles = c("eda", "modeling", "reviewer_zero", "reporting"),
+                            session_name = "default",
+                            project_dir = ".",
+                            output_subdir = "clauder_lab",
+                            max_assembly_rounds = 3) {
+  if (missing(description) || !nzchar(trimws(description))) {
+    stop("`description` is required and must be a non-empty research question or task statement.",
+         call. = FALSE)
+  }
+  valid_roles <- c("eda", "modeling", "reviewer_zero", "reporting")
+  bad <- setdiff(roles, valid_roles)
+  if (length(bad) > 0) {
+    stop(sprintf("Unknown role(s): %s. Valid roles: %s.",
+                 paste(bad, collapse = ", "), paste(valid_roles, collapse = ", ")),
+         call. = FALSE)
+  }
+  if (!is.numeric(max_assembly_rounds) || max_assembly_rounds < 1) {
+    stop("`max_assembly_rounds` must be a positive integer.", call. = FALSE)
+  }
+
+  prompt_path <- system.file("prompts", "lab_mode.md", package = "ClaudeR")
+  if (!nzchar(prompt_path) || !file.exists(prompt_path)) {
+    stop("Lab Mode prompt template not found. Is ClaudeR installed correctly?")
+  }
+
+  # Build the timestamped lab folder path that will appear in the printed protocol.
+  # Normalize to an absolute path so the orchestrator does not nest folders when
+  # its working directory has already been changed (e.g. into a prior lab folder).
+  # Forward slashes everywhere: this path is substituted into R snippets in
+  # the protocol text, and Windows backslashes would make them unparseable.
+  project_dir <- normalizePath(project_dir, mustWork = FALSE, winslash = "/")
+
+  # If the resolved project_dir is itself inside a previous clauder_lab_* run,
+  # walk back up to a neutral parent so the new run doesn't get buried under
+  # prior runs. This handles the case where the user's R session has a stale
+  # working directory inside an old lab folder.
+  parts <- strsplit(project_dir, "/", fixed = TRUE)[[1]]
+  if (length(parts) > 0 && parts[1] == "") parts <- parts[-1]  # drop leading "" from absolute paths
+  nested_idx <- which(grepl("^clauder_lab_", parts))[1]
+  if (!is.na(nested_idx)) {
+    parent_parts <- if (nested_idx > 1) parts[seq_len(nested_idx - 1)] else character(0)
+    if (length(parent_parts) > 0 && parent_parts[length(parent_parts)] == output_subdir) {
+      parent_parts <- parent_parts[-length(parent_parts)]
+    }
+    neutral_dir <- if (length(parent_parts) > 0) paste0("/", paste(parent_parts, collapse = "/")) else "/"
+    message(sprintf(
+      "Note: project_dir was inside a previous lab folder (%s). Using neutral parent (%s) to prevent nesting. Pass project_dir explicitly to override.",
+      project_dir, neutral_dir
+    ))
+    project_dir <- neutral_dir
+  }
+
+  ts <- format(Sys.time(), "%Y%m%d_%H%M%S", tz = "UTC")
+  lab_folder <- file.path(
+    project_dir, output_subdir,
+    sprintf("clauder_lab_%s_%s", session_name, ts)
+  )
+
+  txt <- paste(readLines(prompt_path, warn = FALSE), collapse = "\n")
+  txt <- gsub("{{DESCRIPTION}}", description, txt, fixed = TRUE)
+  txt <- gsub("{{SESSION_NAME}}", session_name, txt, fixed = TRUE)
+  txt <- gsub("{{LAB_FOLDER}}", lab_folder, txt, fixed = TRUE)
+  txt <- gsub("{{ROLES}}", paste(roles, collapse = ", "), txt, fixed = TRUE)
+  txt <- gsub("{{MAX_ROUNDS}}", as.character(as.integer(max_assembly_rounds)), txt, fixed = TRUE)
+  # Round placeholder in vote format is left as {{N}} intentionally -- the orchestrator fills it per round.
+  txt <- gsub("Round {{N}}", "Round <N>", txt, fixed = TRUE)
+
+  cat(txt, "\n")
+  invisible(txt)
+}
+
 #' Load Claude settings
 #'
 #' @return A list containing Claude settings
@@ -1923,8 +3475,13 @@ load_claude_settings <- function() {
   # Default settings
   default_settings <- list(
     print_to_console = TRUE,
-    log_to_file = FALSE,
-    log_file_path = file.path(path.expand("~"), "claude_r_logs.R")
+    # On by default: the log is the audit trail the security model leans on
+    log_to_file = TRUE,
+    log_file_path = file.path(path.expand("~"), "claude_r_logs.R"),
+    # Off by default: enforcing the token rejects any clauder-mcp older than
+    # 0.6.0, which would break existing installs on upgrade. Users flip this on
+    # once both halves are updated.
+    require_token = FALSE
   )
 
   # Try to load settings from a settings file

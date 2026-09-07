@@ -105,16 +105,20 @@ configure <- function(for_cursor = FALSE, use_uvx = TRUE, python_path = NULL) {
 
   
   # --- Add or update the r-studio server entry ---
-  config$mcpServers$`r-studio` <- list(
-    command = mcp_command,
-    args = mcp_args
-  )
+  # Update command and args in place. Anything else the user put on this entry
+  # (most importantly an env block carrying CLAUDER_AGENT_ID) must survive, so
+  # do not replace the whole entry.
+  existing <- config$mcpServers$`r-studio`
+  if (!is.list(existing)) existing <- list()
+  existing$command <- mcp_command
+  existing$args <- mcp_args
+  config$mcpServers$`r-studio` <- existing
 
   
   # --- Write the updated config back to the file ---
   jsonlite::write_json(config, config_path, pretty = TRUE, auto_unbox = TRUE)
 
-  message("\nConfiguration complete! ✨")
+  message("\nConfiguration complete!")
   message("Please completely QUIT and RESTART the Claude Desktop (or Cursor) app.")
   invisible(config_path)
 }
@@ -143,7 +147,7 @@ install_clauder <- function(for_cursor = FALSE, use_uvx = TRUE, python_path = NU
 
   if (length(missing_r_deps) > 0) {
     message(paste("Installing missing R packages:", paste(missing_r_deps, collapse = ", ")))
-    install.packages(missing_r_deps, ...)
+    utils::install.packages(missing_r_deps, ...)
   } else {
     message("All required R dependencies are already installed.")
   }
@@ -161,9 +165,10 @@ install_clauder <- function(for_cursor = FALSE, use_uvx = TRUE, python_path = NU
     }
 
     if (nzchar(temp_python_path)) {
-      message(paste("Attempting to install 'mcp' and 'httpx' using pip from:", temp_python_path))
+      message(paste("Attempting to install 'mcp' (<2) and 'httpx' using pip from:", temp_python_path))
       tryCatch({
-        system2(temp_python_path, args = c("-m", "pip", "install", "--upgrade", "mcp", "httpx"))
+        # mcp 2.0 removed the decorator API the bundled server uses; stay on 1.x
+        system2(temp_python_path, args = c("-m", "pip", "install", "--upgrade", "mcp<2", "httpx"))
       }, warning = function(w) {
         message("\nWarning during pip install: ", w$message)
         if (grepl("externally-managed-environment", w$message)) {
@@ -173,7 +178,7 @@ install_clauder <- function(for_cursor = FALSE, use_uvx = TRUE, python_path = NU
         message("\nError during pip install: ", e$message)
       })
     } else {
-      warning("Could not find a Python executable. Please install 'mcp' and 'httpx' manually using pip.")
+      warning("Could not find a Python executable. Please install manually: pip install 'mcp<2' httpx")
     }
   } else {
     message("\n--- Step 2: Using uvx (recommended) ---")
@@ -197,7 +202,7 @@ install_clauder <- function(for_cursor = FALSE, use_uvx = TRUE, python_path = NU
   step_num <- if (use_uvx) "Step 3" else "Step 3"
   message(paste0("\n--- ", step_num, ": Running automatic MCP configuration ---"))
   tryCatch({
-    ClaudeR:::configure(for_cursor = for_cursor, use_uvx = use_uvx, python_path = python_path)
+    configure(for_cursor = for_cursor, use_uvx = use_uvx, python_path = python_path)
   }, error = function(e) {
     message("\nConfiguration failed with an error:")
     stop(e$message)

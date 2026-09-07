@@ -14,6 +14,13 @@ The coverage tracker is a formal proof that every line of the manuscript was
 evaluated. The claim registry stores extracted claims for verification.
 
 ```r
+# 0. Audit-clean console output. Tibble's 3-sig-fig default can hide the
+#    precision a manuscript displays (printing 5038.46 as "5038."), which
+#    manufactures false mismatches during reconciliation. Set this FIRST,
+#    before anything prints or is logged.
+options(pillar.sigfig = 7, tibble.print_max = Inf, tibble.width = Inf,
+        width = 200, digits = 7)
+
 # 1. Coverage tracker: proves every line was evaluated
 # extract_manuscript_text() handles .docx, .pdf, .qmd, .Rmd, .tex, and plain text
 doc_lines <- ClaudeR::extract_manuscript_text("path_to_manuscript")  # Replace with actual file path
@@ -177,6 +184,46 @@ call, the audit skipped Pass 2 and the results should not be trusted.
 
 Now locate and re-execute the code that produced each claim.
 
+### Step 3.0: Value sweep — the backbone (reconcile_values)
+
+Before pairing claims to code, run the deterministic sweep. Reading
+carefully is necessary but not sufficient: you can misread a number while
+reading diligently, and no reading gate catches that. The sweep enumerates
+EVERY numeric value in the manuscript and supplement and reconciles each
+against the corpus of numbers the code actually produced. Completeness by
+construction beats diligence.
+
+1. Assemble the source corpus: the session log(s), any generated table
+   files (.docx/.csv), and clean-room script outputs from
+   `probe_scripts(capture_output = TRUE)`.
+2. Call the `reconcile_values` tool with the manuscript and those sources.
+   Run it again for the supplement if there is one. It assigns
+   `values_registry` to the global environment: one row per numeric value,
+   with status matched / matched_scaled / threshold_ok / unmatched /
+   year_skipped.
+3. Adjudicate every `unmatched` row: either recompute it with `execute_r`
+   (and record the result), or record why it cannot come from the sources
+   (citation fragment, DOI digits, section number, count stated in prose
+   only). For each adjudicated row set:
+
+```r
+values_registry$adjudicated[values_registry$value_id == ID] <- TRUE
+values_registry$note[values_registry$value_id == ID] <- "recomputed: 0.9668, matches at displayed precision"
+```
+
+#### Value-sweep gate
+You CANNOT proceed past Pass 3 until every value is accounted for:
+
+```r
+pending <- subset(values_registry, status == "unmatched" & !adjudicated)
+cat(sprintf("Value sweep: %d values total, %d unmatched pending adjudication\n",
+    nrow(values_registry), nrow(pending)))
+stopifnot(nrow(pending) == 0)
+```
+
+The claim-level work below (3a-3d) provides the *context and labels* for
+the values that carry claims; the sweep proves nothing was skipped.
+
 ### Step 3a: Map claims to code
 - Use `search_project_code` to find where variables, models, or test functions
   appear across the project's R scripts.
@@ -185,6 +232,11 @@ Now locate and re-execute the code that produced each claim.
 - Use `read_file` with pagination to inspect relevant code sections.
 
 ### Step 3b: Execute and compare programmatically
+- Prefer a CLEAN ROOM for final verdicts: `probe_scripts(capture_output = TRUE)`
+  sources each script in a fresh background session and returns its printed
+  statistics, so a stale object in the live environment can never make a
+  check agree spuriously. If you must verify in the live session, checkpoint
+  first and clear the objects the script will recreate.
 - Use `execute_r` to load data and run the specific analysis for each claim.
 - Do NOT manually decide whether values match. Let R determine the status
   using `all.equal()` with an appropriate tolerance.
@@ -204,6 +256,15 @@ claim_registry$status[i] <- if (is_match) "match" else if (is_rounding) "roundin
 ```
 
 R sets the status. You do not. This prevents eyeballing "close enough" values.
+
+Integer counts are exempt from tolerance: sample sizes, degrees of freedom,
+cell counts, and exclusion tallies must match EXACTLY. A count that differs
+by one is a discrepancy, never rounding. Apply `all.equal` tolerance only to
+continuous statistics.
+
+Strip names before comparing: components extracted from test objects carry
+names (`t.test(...)$statistic` is named "t"), and `all.equal` reports a
+names mismatch as inequality. Wrap extractions in `unname()`.
 
 For claims with multiple values (e.g., "t(38) = 2.12, p = .041, d = 0.34"),
 test each value separately. If any single value is a discrepancy, the whole
@@ -322,7 +383,100 @@ After verifying statistical claims, check that the bibliography is real.
 ### Step 4c: In-text citation cross-check
 - Confirm every in-text citation (Author, Year) appears in the bibliography.
 - Confirm every bibliography entry is cited at least once in the text.
+- Match on author AND year together, never surname alone: the same author
+  can appear in multiple entries (and as a co-author in others), so
+  surname-only matching produces false matches in both directions.
 - Flag orphaned citations and uncited references.
+
+---
+
+## Pass 5: Content reasoning (the defects no tool can surface)
+
+Passes 1-4 and their tools (`reconcile_values`, `verify_references`,
+`check_cross_references`, `probe_scripts`) find numeric, reference,
+cross-reference, and code defects. They do not reason about meaning. A
+manuscript can clear every gate above and still contain serious defects that
+only a close, skeptical read finds, and those are the defects that separate a
+real audit from a checklist.
+
+This pass is mandatory and carries equal weight with the tool passes. Do not
+treat it as optional, and do not let the tool output stand in for it: the
+tools have already told you everything they can. Read the manuscript prose
+again, slowly, with the tool output in hand, and bring outside domain
+knowledge the tools do not have. A claim can be false when every number in it
+reconciles.
+
+Build a reasoning registry so the checks are tracked and gated like every
+other pass:
+
+```r
+reasoning_registry <- data.frame(
+  check = c("instrument_attribution", "test_computability",
+            "figure_claim_match", "magnitude_wording",
+            "convergence_consistency", "causal_generality_framing",
+            "data_existence", "supplement_integration"),
+  status = "unrun",           # unrun -> clear | defect
+  finding = "",               # verbatim claim + what is wrong
+  stringsAsFactors = FALSE)
+```
+
+Run every check. For each, quote the verbatim claim, state the finding, and
+set `status` to `clear` or `defect`. A defect here is reported exactly like a
+Pass 3 discrepancy.
+
+1. **Instrument and source attribution.** For every named scale, task, or
+   measure with a citation, does the cited source match the instrument as
+   described (item count, version, authorship)? Example defect: a "22-item"
+   scale attributed to the paper that introduced the 10-item version. This
+   needs knowledge of the instrument, not a value check.
+2. **Test computability.** For every reported test or statistic, can it
+   actually be computed from the variables that exist in the data? Inspect the
+   data columns with `execute_r`. A reported p-value or group comparison for
+   which no supporting variable exists is a defect, not a number to reconcile
+   (e.g. "accuracy did not differ across conditions" when only one accuracy
+   value per participant exists).
+3. **Figure and table content versus claim.** For every figure or table cited
+   in support of a claim, does it actually contain the evidence claimed? A
+   figure cited for a relationship it does not plot (a speed-only boxplot
+   cited for a speed-accuracy trade-off) is a defect even though the
+   cross-reference resolves.
+4. **Magnitude wording.** For every qualitative magnitude word ("roughly
+   twice", "comparable", "doubled", "small"), recompute the actual
+   ratio or difference and check the word fits. "Roughly twice" for a computed
+   2.8x is a defect.
+5. **Convergence and consistency of argument.** Does any claim that results
+   "converge", "replicate", or "hold across both studies" survive when a
+   measure was collected in only one study, or a construct was operationalized
+   differently across them? Cross-check what each study actually measured.
+6. **Causal and generality framing.** Does any causal-mechanism claim rest on
+   a manipulated cause with only a measured (correlational) mediator, with no
+   mediation test? Does any generality claim ("generalize across populations
+   and contexts") exceed a single sample and a stylized task, especially where
+   the paper's own limitations contradict it?
+7. **Data existence for descriptive claims.** For every descriptive or
+   reliability claim (demographics, Cronbach's alpha, "measures collected"),
+   does the supporting data exist anywhere in the project? A claim resting on
+   data absent from the corpus must be flagged as unverifiable.
+8. **Supplement and appendix integration.** Is every supplementary file, table,
+   or appendix cited somewhere in the manuscript body? Conversely, does any body
+   claim depend on evidence that appears only in an uncited supplement or
+   appendix? A load-bearing argument whose support lives in a supplement the
+   text never points to is a defect, not a formatting lapse.
+
+### Reasoning-pass gate
+
+You cannot proceed to the Final Report until every check has been run:
+
+```r
+unrun_checks <- sum(reasoning_registry$status == "unrun")
+cat(sprintf("Reasoning pass: %d / %d checks run (%d defects, %d unrun)\n",
+    sum(reasoning_registry$status != "unrun"), nrow(reasoning_registry),
+    sum(reasoning_registry$status == "defect"), unrun_checks))
+stopifnot(unrun_checks == 0)
+```
+
+A clean result (all checks `clear`) on a sound paper is a valid outcome. Do
+not invent a reasoning defect to fill the pass.
 
 ---
 
@@ -334,12 +488,21 @@ After all claims and references are processed, generate a summary:
 cat("\n=== REVIEWER ZERO AUDIT REPORT ===\n")
 cat(sprintf("Coverage: %d / %d lines evaluated\n",
     sum(coverage$status != "unread"), nrow(coverage)))
+cat(sprintf("Value sweep: %d values | matched: %d | threshold_ok: %d | adjudicated: %d | years skipped: %d\n",
+    nrow(values_registry),
+    sum(values_registry$status %in% c("matched", "matched_scaled")),
+    sum(values_registry$status == "threshold_ok"),
+    sum(values_registry$status == "unmatched" & values_registry$adjudicated),
+    sum(values_registry$status == "year_skipped")))
 cat(sprintf("Total claims: %d\n", nrow(claim_registry)))
 cat(sprintf("Matches: %d\n", sum(claim_registry$status == "match")))
 cat(sprintf("Rounding only: %d\n", sum(claim_registry$status == "rounding")))
 cat(sprintf("Discrepancies: %d\n", sum(claim_registry$status == "discrepancy")))
 cat(sprintf("Not found in code: %d\n", sum(claim_registry$status == "not_found")))
 cat(sprintf("Errors: %d\n", sum(claim_registry$status == "error")))
+cat(sprintf("Reasoning checks: %d run | %d defects\n",
+    sum(reasoning_registry$status != "unrun"),
+    sum(reasoning_registry$status == "defect")))
 ```
 
 Then print the full registry and highlight every discrepancy with:
@@ -359,6 +522,12 @@ Include an internal consistency section listing:
 - Any cases where the same reported outcome was computed differently
   elsewhere in the code, with both results shown
 - If no inconsistencies were found, state that explicitly
+
+Include a content-reasoning section (Pass 5) listing:
+- Each reasoning check and its result (clear or defect)
+- For each defect, the verbatim claim and why it fails, treated with the
+  same weight as a numeric discrepancy
+- If all checks were clear, state that explicitly
 
 ---
 
@@ -384,3 +553,18 @@ Include an internal consistency section listing:
 11. You must read every line of every analysis script by the end of Pass 3.
     Do not flag unreported analyses on different variables -- only flag code
     that produces different results for the same reported outcomes.
+12. Set the audit-clean print options (Setup step 0) before anything prints.
+    Console output that truncates precision fights the audit.
+13. Every row of `values_registry` must end as matched, matched_scaled,
+    threshold_ok, year_skipped, or adjudicated-with-a-note. The value-sweep
+    gate is the completion criterion for numeric fidelity -- reading gates
+    prove diligence, the registry proves completeness.
+14. Final verdicts come from clean-room recomputation
+    (`probe_scripts(capture_output = TRUE)` or a fresh background session),
+    never from a long-lived environment that may hold stale objects.
+15. The tools do not reason. Pass 5 is not optional and is not covered by any
+    tool: a manuscript can pass every numeric, reference, and cross-reference
+    gate and still misattribute an instrument, cite a figure for evidence it
+    does not contain, report a test its data cannot support, or overstate a
+    magnitude or a causal claim. Run every reasoning check and weight its
+    findings equally with the numeric ones.

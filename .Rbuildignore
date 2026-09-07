@@ -1,4 +1,16 @@
 ^.*\.Rproj$
 ^\.Rproj\.user$
+^\.git$
 assets
 ^\.github$
+^\.claude$
+^clauder-mcp$
+^Dockerfile$
+^glama\.json$
+^llms-install\.md$
+^FORK_COMPATIBILITY\.md$
+^.*__pycache__$
+^.*\.DS_Store$
+^Rplots\.pdf$
+^LICENSE\.md$
+^\.mcpregistry_.*$

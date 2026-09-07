@@ -55,7 +55,6 @@ generate_session_token <- function() {
 }
 
 write_discovery_file <- function(session_name, port, token) {
-  s <- tryCatch(load_claude_settings(), error = function(e) list())
   d <- discovery_dir()
   if (!dir.exists(d)) dir.create(d, recursive = TRUE, mode = "0700")
   info <- list(
@@ -63,11 +62,7 @@ write_discovery_file <- function(session_name, port, token) {
     port = port,
     pid = Sys.getpid(),
     token = token,
-    started_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
-    # Read by the bridge on each call. Absent in files written by older
-    # versions, where the bridge falls back to its own defaults.
-    plot_auto = isTRUE(s$plot_auto),
-    tool_sets = if (is.null(s$tool_sets)) "all" else s$tool_sets
+    started_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S")
   )
   f <- file.path(d, paste0(session_name, ".json"))
   # Two live sessions sharing a name would silently clobber each other's
@@ -492,7 +487,6 @@ check_background_job <- function(job_id) {
 #' Claude R Studio Add-in using HTTP server
 #'
 #' @importFrom shiny observeEvent reactiveValues renderText verbatimTextOutput
-#' @importFrom shiny checkboxGroupInput
 #'   actionButton numericInput checkboxInput textInput conditionalPanel
 #'   showNotification invalidateLater runGadget paneViewer stopApp
 #'   observe tags wellPanel
@@ -657,9 +651,7 @@ claudeAddin <- function() {
               }
 
               # --- Sync: execute in main session ---
-              result <- execute_code_in_session(body$code, .claude_server_env$settings,
-                                               agent_id = agent_id,
-                                               want_plot = body$want_plot)
+              result <- execute_code_in_session(body$code, .claude_server_env$settings, agent_id = agent_id)
               .claude_server_env$execution_count <- .claude_server_env$execution_count + 1L
 
               # Return the result as JSON
@@ -784,29 +776,6 @@ claudeAddin <- function() {
         )
       ),
 
-      # --- Agent context ---
-      tags$div(class = "section-label", "AGENT CONTEXT"),
-      wellPanel(
-        checkboxInput("plot_auto", "Send plots to the agent automatically",
-                         value = isTRUE(settings$plot_auto)),
-        tags$div(style = "font-size:11px;color:#888;margin:-6px 0 10px 20px;",
-                 "Off: the agent is told a plot was drawn and asks for it. ",
-                 "Saves roughly 4,500 tokens per image. Your Plots pane is unaffected."),
-        checkboxGroupInput("tool_sets", "Tools available to the agent",
-          choices = c("Code execution and files" = "core",
-                      "Editor (modify, insert, suggest)" = "editor",
-                      "Session (checkpoints, history, logs)" = "session",
-                      "Multi-agent coordination" = "coord",
-                      "Background jobs" = "async",
-                      "Manuscript audit and bibliography" = "audit"),
-          selected = if (is.null(settings$tool_sets)) {
-            c("core","editor","session","coord","async","audit")
-          } else settings$tool_sets),
-        tags$div(style = "font-size:11px;color:#888;margin-top:-4px;",
-                 "All 41 tools cost about 8,600 tokens of schema on every request. ",
-                 "Unticking a group hides it. Some clients need a reconnect to notice.")
-      ),
-
       # --- Advanced ---
       tags$div(class = "section-label",
         "ADVANCED",
@@ -858,31 +827,6 @@ claudeAddin <- function() {
     observeEvent(input$print_to_console, {
       update_setting("print_to_console", input$print_to_console)
     }, ignoreInit = TRUE)
-    # Both of these are read by the bridge out of the discovery file, so the
-    # file is rewritten on change and a running session picks it up without a
-    # restart.
-    refresh_discovery <- function() {
-      tryCatch({
-        st <- .claude_server_env
-        if (isTRUE(st$running) && !is.null(st$session_name) && !is.null(st$port)) {
-          write_discovery_file(st$session_name, st$port, st$token)
-        }
-      }, error = function(e) NULL)
-    }
-
-    observeEvent(input$plot_auto, {
-      update_setting("plot_auto", isTRUE(input$plot_auto))
-      refresh_discovery()
-    }, ignoreInit = TRUE)
-
-    observeEvent(input$tool_sets, {
-      all <- c("core","editor","session","coord","async","audit")
-      sel <- input$tool_sets
-      # Everything ticked is stored as NULL, meaning "no filter".
-      update_setting("tool_sets", if (is.null(sel) || setequal(sel, all)) NULL else sel)
-      refresh_discovery()
-    }, ignoreInit = TRUE, ignoreNULL = FALSE)
-
     observeEvent(input$log_console, {
       update_setting("log_console", input$log_console)
       if (isTRUE(input$log_console)) start_console_logging() else stop_console_logging()
@@ -1382,16 +1326,13 @@ truncate_output <- function(lines, max_lines = 500L, max_chars = 50000L) {
 #' @param code The R code to execute
 #' @param settings The settings list with logging preferences
 #' @param agent_id Optional agent identifier for attribution
-#' @param want_plot If TRUE, always return the plot, overriding the session's
-#'   plot_auto setting. Used by the execute_r_with_plot tool.
 #' @return A list containing the execution result and metadata
 #' @importFrom ggplot2 ggplot aes geom_bar geom_line theme_minimal ggsave
 #' @importFrom base64enc base64encode
 #' @importFrom grDevices dev.copy dev.list dev.off png jpeg recordPlot
 #' @export
 
-execute_code_in_session <- function(code, settings = NULL, agent_id = NULL,
-                                    want_plot = NULL) {
+execute_code_in_session <- function(code, settings = NULL, agent_id = NULL) {
   # Default settings if not provided
   if (is.null(settings)) {
     settings <- load_claude_settings()
@@ -1521,12 +1462,8 @@ execute_code_in_session <- function(code, settings = NULL, agent_id = NULL,
     plot_mime <- "image/png"
 
     tryCatch({
-      # For ggplot objects: capture only if the object was actually shown.
-      # `p <- ggplot(...)` returns the plot invisibly, so testing the class
-      # alone sent the agent an image the user never saw in the Plots pane.
-      # A printed plot (print(p), or a plot drawn inside a function) reaches
-      # the device instead and is picked up by the device check below.
-      if (isTRUE(result$visible) && inherits(result$value, "ggplot")) {
+      # For ggplot objects: always a new plot
+      if (inherits(result$value, "ggplot")) {
         # Try PNG first (sharp lines/text, often smaller for plots)
         tryCatch({
           ggsave(plot_file_png, result$value,
@@ -1630,25 +1567,11 @@ execute_code_in_session <- function(code, settings = NULL, agent_id = NULL,
     }
 
     # Include plot if available
-    # want_plot = TRUE is execute_r_with_plot asking explicitly, and always
-    # wins. Otherwise the session's plot_auto setting decides. When a plot was
-    # drawn but withheld, say so, so the agent knows it can ask for it.
-    send_plot <- isTRUE(want_plot) ||
-      isTRUE(tryCatch(load_claude_settings()$plot_auto, error = function(e) TRUE))
     if (captured_plot && !is.null(plot_data)) {
-      if (send_plot) {
-        response$plot <- list(
-          data = plot_data,
-          mime_type = plot_mime
-        )
-      } else {
-        response$plot_available <- TRUE
-        response$output <- paste0(
-          response$output,
-          if (nzchar(response$output %||% "")) "\n" else "",
-          "[a plot was drawn; call execute_r_with_plot to see it]"
-        )
-      }
+      response$plot <- list(
+        data = plot_data,
+        mime_type = plot_mime
+      )
     }
 
     # Flag if viewer content was captured (htmlwidgets)
@@ -3313,16 +3236,7 @@ load_claude_settings <- function() {
     # Off by default: enforcing the token rejects any clauder-mcp older than
     # 0.6.0, which would break existing installs on upgrade. Users flip this on
     # once both halves are updated.
-    require_token = FALSE,
-    # On by default: sending the plot with the result is the behaviour every
-    # existing user has. Turn it off to save the ~4.5k tokens an image costs
-    # when you mostly want text; the agent is told a plot was drawn and can
-    # ask for it with execute_r_with_plot.
-    plot_auto = TRUE,
-    # Which groups of MCP tools this session exposes. NULL means all of them.
-    # Trimming the list cuts the ~8.6k tokens of schema sent on every request
-    # and gives the agent fewer near-miss tools to choose between.
-    tool_sets = NULL
+    require_token = FALSE
   )
 
   # Try to load settings from a settings file

@@ -113,6 +113,32 @@ def discover_sessions() -> List[Dict[str, Any]]:
     return sessions
 
 
+def _session_info() -> Optional[Dict[str, Any]]:
+    """The discovery record for the session we are bound to, if any.
+
+    Read fresh each time rather than cached: the addin rewrites the file when
+    the user changes a setting, and connect_session can re-bind mid-session.
+    """
+    try:
+        sessions = discover_sessions()
+        if not sessions:
+            return None
+        if _target_session:
+            for s in sessions:
+                if s.get("session_name") == _target_session:
+                    return s
+        # Same preference order as get_r_addin_url, so the tools we advertise
+        # always belong to the session the agent will actually talk to.
+        pick = next((s for s in sessions
+                     if s.get("session_name") == "default"), None)
+        if not pick:
+            sessions.sort(key=lambda s: s.get("port", 99999))
+            pick = sessions[0]
+        return pick
+    except Exception:
+        return None
+
+
 def get_r_addin_url() -> Optional[str]:
     """Get the URL for the active R session. Binds on first resolution and
     stays sticky. Prefers the 'default' session when no target is set.
@@ -192,8 +218,13 @@ def escape_r_string(s: str) -> str:
     return s
 
 # Function to execute R code via the HTTP addin
-async def execute_r_code_via_addin(code: str) -> Dict[str, Any]:
-    """Execute R code through the RStudio addin HTTP server."""
+async def execute_r_code_via_addin(code: str, want_plot: bool = False) -> Dict[str, Any]:
+    """Execute R code through the RStudio addin HTTP server.
+
+    want_plot=True is execute_r_with_plot asking explicitly; it overrides the
+    session's plot_auto setting. Older R servers ignore the field and return
+    the plot as before.
+    """
     url = get_r_addin_url()
     if url is None:
         return {
@@ -202,6 +233,8 @@ async def execute_r_code_via_addin(code: str) -> Dict[str, Any]:
         }
     try:
         payload: Dict[str, Any] = {"code": code}
+        if want_plot:
+            payload["want_plot"] = True
         if _agent_id:
             payload["agent_id"] = _agent_id
         async with httpx.AsyncClient() as client:
@@ -778,10 +811,55 @@ def _save_annotation_csv() -> None:
         writer.writerows(_annot_state["rows"])
 
 
-# Define available tools
-@server.list_tools()
-async def list_tools() -> List[types.Tool]:
-    """List available R tools."""
+# Which group each tool belongs to. The addin writes the enabled groups into
+# the session's discovery file. Anything not listed counts as core, so a newly
+# added tool is never hidden by accident.
+TOOL_GROUPS: Dict[str, str] = {}
+for _n in ("get_active_document", "modify_code_section", "insert_text", "suggest_edit"):
+    TOOL_GROUPS[_n] = "editor"
+for _n in ("checkpoint_session", "restore_session", "list_checkpoints",
+           "get_session_history", "generate_notebook", "clean_error_log"):
+    TOOL_GROUPS[_n] = "session"
+for _n in ("send_message", "check_messages", "wait_for_message", "coordination_roster",
+           "set_agent_name", "create_task_list", "update_task_status"):
+    TOOL_GROUPS[_n] = "coord"
+for _n in ("execute_r_async", "get_async_result", "cancel_async_job"):
+    TOOL_GROUPS[_n] = "async"
+for _n in ("reconcile_values", "verify_references", "check_cross_references",
+           "probe_scripts", "screening_report", "get_bibtex", "search_citations",
+           "annotate", "run_annotation_job", "get_annotation_job_status",
+           "cancel_annotation_job", "load_annotation_data", "generate_codebook"):
+    TOOL_GROUPS[_n] = "audit"
+
+
+def _enabled_tool_sets() -> Optional[List[str]]:
+    """Groups this session exposes, or None meaning all of them."""
+    info = _session_info()
+    if not info:
+        return None
+    sets = info.get("tool_sets")
+    if not sets or sets == "all" or sets == ["all"]:
+        return None
+    return list(sets) if isinstance(sets, list) else [sets]
+
+
+def _filter_tools(tools: List[types.Tool]) -> List[types.Tool]:
+    """Drop tools whose group the session switched off.
+
+    connect_session and list_sessions always survive: without them an agent
+    cannot reach the session that holds the setting.
+    """
+    enabled = _enabled_tool_sets()
+    if enabled is None:
+        return tools
+    always = {"connect_session", "list_sessions"}
+    keep = [t for t in tools
+            if t.name in always or TOOL_GROUPS.get(t.name, "core") in enabled]
+    return keep or tools
+
+
+def _all_tools() -> List[types.Tool]:
+    """Every tool this server implements, before per-session filtering."""
     return [
         types.Tool(
             name="execute_r",
@@ -1927,6 +2005,13 @@ async def list_tools() -> List[types.Tool]:
         ),
     ]
 
+
+# Define available tools
+@server.list_tools()
+async def list_tools() -> List[types.Tool]:
+    """List available R tools, minus any group this session switched off."""
+    return _filter_tools(_all_tools())
+
 @server.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextContent | types.ImageContent]:
     """Handle R tool calls."""
@@ -2017,7 +2102,9 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
             )]
 
         # The package is available, so just execute the user's code directly.
-        result = await execute_r_code_via_addin(arguments["code"])
+        # want_plot=True: this tool exists to return the image, so it overrides
+        # the session's plot_auto setting.
+        result = await execute_r_code_via_addin(arguments["code"], want_plot=True)
         
         # Add text output
         if "output" in result and result["output"]:

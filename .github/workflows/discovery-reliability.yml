@@ -28,5 +28,6 @@ jobs:
         with:
           dependencies: '"hard"'
       - run: R CMD INSTALL .
+        shell: bash
       - run: Rscript tests/discovery-reliability.R
       - run: Rscript tests/async-output-backpressure.R

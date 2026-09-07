@@ -8,6 +8,7 @@ assets
 ^Dockerfile$
 ^glama\.json$
 ^llms-install\.md$
+^FORK_COMPATIBILITY\.md$
 ^.*__pycache__$
 ^.*\.DS_Store$
 ^Rplots\.pdf$

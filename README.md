@@ -17,6 +17,11 @@
   </p>
 </div>
 
+> **LZHS workbench users:** this is the compatibility fork, not the upstream
+> install channel. Read [FORK_COMPATIBILITY.md](FORK_COMPATIBILITY.md) for the
+> paired R/bridge versions, fork extensions and reliability checks before using
+> the upstream Quick Start below.
+
 ---
 
 > **Heads up: a name change is coming.** Another R package already uses the name claudeR, so this package will be renamed in the next couple of weeks. Only the name will change. The tools, the installers, and your workflows stay exactly the same. Install instructions here will be updated the day it happens.

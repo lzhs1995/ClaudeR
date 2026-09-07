@@ -17,11 +17,6 @@
   </p>
 </div>
 
----
-
-> **Heads up: a name change is coming.** Another R package already uses the name claudeR, so this package will be renamed in the next couple of weeks. Only the name will change. The tools, the installers, and your workflows stay exactly the same. Install instructions here will be updated the day it happens.
-
----
 
 **ClaudeR** is an R package that forges a direct link between RStudio and MCP configured LLM agents like Claude Code or Codex. This allows interactive coding sessions where the agent can execute code in your active RStudio environment so it can see the executed code and any generated plots in real-time. If you need help editing a script, a quick analysis done, or an LLM to audit your statistical claims against any manuscript before submission: ClaudeR has got your back.
 

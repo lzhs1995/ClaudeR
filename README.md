@@ -17,6 +17,8 @@
   </p>
 </div>
 
+[English](README.md) · [繁體中文](README.zh-TW.md)
+
 > **LZHS workbench users:** this is the compatibility fork, not the upstream
 > install channel. Read [FORK_COMPATIBILITY.md](FORK_COMPATIBILITY.md) for the
 > paired R/bridge versions, fork extensions and reliability checks before using
@@ -494,7 +496,7 @@ A new log file is created each time you click **Start Server**. All code execute
 - "Load the `mtcars` dataset and create a scatterplot of `mpg` vs. `hp` with a trend line."
 - "Fit a linear model to predict `mpg` based on `wt` and `hp`."
 - "Generate a correlation matrix for the `iris` dataset and visualize it."
-- "I have a qmd file active. Please make a nice quarto presentation on gradient descent. The audience is very technical. Make sure it looks smooth. Save the presentation in /Users/nyk/QuartoDocs/"
+- "I have a qmd file active. Please make a nice quarto presentation on gradient descent. The audience is very technical. Make sure it looks smooth. Save the presentation in ./presentation-output/"
 
 If you can do it with R, your AI assistant can too.
 

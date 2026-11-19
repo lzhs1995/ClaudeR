@@ -288,3 +288,466 @@ class TestSetAgentNameGuard:
         asyncio.run(_srv.call_tool(
             "set_agent_name", {"name": "Claude-Gatherers"}))
         assert _srv._agent_id == "Claude-Gatherers"
+
+
+# --- get_async_result waits for the job ------------------------------------
+
+import time
+
+
+def _fake_r(monkeypatch, replies):
+    """Bind to a pretend live R session whose check_job answers come from
+    `replies` in order (the last one repeats). Returns the list of calls."""
+    calls = []
+
+    async def fake_post(payload, timeout=10.0):
+        calls.append(payload)
+        return replies[min(len(calls), len(replies)) - 1]
+
+    async def fake_status(return_info=False):
+        return True
+
+    monkeypatch.setattr(_srv, "_session_language", lambda: "r")
+    monkeypatch.setattr(_srv, "get_r_addin_url", lambda: "http://127.0.0.1:1")
+    monkeypatch.setattr(_srv, "check_addin_status", fake_status)
+    monkeypatch.setattr(_srv, "_agent_introduced", True)
+    monkeypatch.setattr(_srv, "_rebind_note", None)
+    monkeypatch.setattr(_srv, "post_to_r_addin", fake_post)
+    return calls
+
+
+RUNNING = {"status": "running", "elapsed_seconds": 5}
+DONE = {"status": "complete", "success": True, "output": "fit done"}
+
+
+class TestAsyncWait:
+    """One call should wait for the job instead of making the agent poll
+    every 10 s (a 20-minute fit used to cost ~120 calls)."""
+
+    def test_returns_as_soon_as_job_finishes(self, monkeypatch):
+        calls = _fake_r(monkeypatch, [RUNNING, RUNNING, DONE])
+        t0 = time.monotonic()
+        out = asyncio.run(_srv.call_tool("get_async_result",
+                                         {"job_id": "j1", "wait_s": 60}))
+        assert out[0].text == "fit done"
+        assert len(calls) == 3
+        assert time.monotonic() - t0 < 10   # 2 s + 3 s of back-off, not 60
+
+    def test_already_finished_job_has_no_delay(self, monkeypatch):
+        calls = _fake_r(monkeypatch, [DONE])
+        t0 = time.monotonic()
+        out = asyncio.run(_srv.call_tool("get_async_result", {"job_id": "j1"}))
+        assert out[0].text == "fit done"
+        assert len(calls) == 1
+        assert time.monotonic() - t0 < 1    # the old code always slept 10 s
+
+    def test_wait_zero_checks_once(self, monkeypatch):
+        calls = _fake_r(monkeypatch, [RUNNING])
+        out = asyncio.run(_srv.call_tool("get_async_result",
+                                         {"job_id": "j1", "wait_s": 0}))
+        assert len(calls) == 1
+        assert "still running" in out[0].text
+
+    def test_gives_up_at_wait_s_and_says_to_call_again(self, monkeypatch):
+        calls = _fake_r(monkeypatch, [RUNNING])
+        t0 = time.monotonic()
+        out = asyncio.run(_srv.call_tool("get_async_result",
+                                         {"job_id": "j1", "wait_s": 3}))
+        took = time.monotonic() - t0
+        assert 2.5 < took < 5
+        assert "still running" in out[0].text and "again" in out[0].text
+        assert len(calls) >= 2
+
+    def test_unknown_job_stops_waiting(self, monkeypatch):
+        calls = _fake_r(monkeypatch, [{"status": "not_found"}])
+        out = asyncio.run(_srv.call_tool("get_async_result",
+                                         {"job_id": "nope", "wait_s": 60}))
+        assert len(calls) == 1
+        assert "No job found" in out[0].text
+
+    def test_lost_connection_stops_waiting(self, monkeypatch):
+        calls = _fake_r(monkeypatch, [{"success": False,
+                                       "error": "Error communicating with RStudio: refused"}])
+        out = asyncio.run(_srv.call_tool("get_async_result",
+                                         {"job_id": "j1", "wait_s": 60}))
+        assert len(calls) == 1
+        assert "refused" in out[0].text
+
+    def test_bad_wait_value_falls_back(self, monkeypatch):
+        calls = _fake_r(monkeypatch, [DONE])
+        out = asyncio.run(_srv.call_tool("get_async_result",
+                                         {"job_id": "j1", "wait_s": "soon"}))
+        assert out[0].text == "fit done"
+
+
+# --- annotation jobs: locked-down calls, retries, raw replies, limit stop ---
+
+import json
+import os
+import sys
+
+FAKE_HELP = ("  --safe-mode   x\n  --tools <tools...>   x\n  --strict-mcp-config   x\n"
+             "  --disable-slash-commands   x\n  --output-format <format>   x\n"
+             "  --append-system-prompt <prompt>   x\n  --system-prompt <prompt>   x\n")
+
+FAKE_CLAUDE = r'''#!{python}
+# Stands in for the claude CLI. What it does comes from FAKE_MODE; every call
+# is recorded in FAKE_LOG (argv, folder, whether an API key was visible).
+import json, os, sys
+if "--help" in sys.argv:
+    print(os.environ.get("FAKE_HELP", ""))
+    sys.exit(0)
+prompt = sys.stdin.read()
+log = os.environ["FAKE_LOG"]
+n = sum(1 for _ in open(log)) if os.path.exists(log) else 0
+with open(log, "a") as f:
+    f.write(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd(), "cwd_files": os.listdir("."),
+                        "api_key": "ANTHROPIC_API_KEY" in os.environ, "prompt": prompt,
+                        "anthropic_vars": sorted(k for k in os.environ if k.startswith("ANTHROPIC_"))}}) + "\n")
+mode = os.environ["FAKE_MODE"]
+keys = [json.loads(l)["_row"] for l in prompt.splitlines() if l.startswith("{{") and '"_row"' in l]
+if mode == "bad_then_ok" and n == 0 or mode == "always_bad":
+    reply = "I think this one is about a person."
+elif mode == "limit":
+    print(json.dumps([{{"type": "result", "is_error": True, "result": "You've hit your limit, resets 5pm"}}]))
+    sys.exit(1)
+elif mode == "batch_missing_one" and n == 0:
+    reply = json.dumps({{k: {{"label": "person"}} for k in keys[:-1]}})
+elif keys:
+    reply = json.dumps({{k: {{"label": "person"}} for k in keys}})
+else:
+    reply = '```json\n{{"label": "person"}}\n```'
+if "--output-format" in sys.argv:
+    # The event list Claude Code prints, rate-limit status line included.
+    print(json.dumps([{{"type": "system"}},
+                      {{"type": "rate_limit_event", "rate_limit_info": {{"status": "allowed"}}}},
+                      {{"type": "result", "is_error": False, "result": reply}}]))
+else:
+    print(reply)
+'''
+
+
+def _annot_rows(n=1):
+    rows = [{"row_id": str(i + 1), "message": f"message {i + 1}", "label": "",
+             "_schema": "label:choice[person,thing]" if i == 0 else ""} for i in range(n)]
+    return rows, ["row_id", "message", "label", "_schema"]
+
+
+def _run_annot(tmp_path, monkeypatch, mode, n=1, help_text=FAKE_HELP, **kw):
+    """Run one annotation job against the fake CLI, in this thread. Returns
+    (job, calls, rows, raw replies)."""
+    script = tmp_path / "fake_claude.py"
+    script.write_text(FAKE_CLAUDE.format(python=sys.executable))
+    if os.name == "nt":
+        # Windows cannot run a script by its #! line, so wrap it the way npm
+        # wraps the real claude.
+        fake = tmp_path / "claude.cmd"
+        fake.write_text(f'@"{sys.executable}" "{script}" %*\r\n')
+    else:
+        fake = script
+        fake.chmod(0o755)
+    monkeypatch.setenv("FAKE_MODE", mode)
+    monkeypatch.setenv("FAKE_LOG", str(tmp_path / "calls.jsonl"))
+    monkeypatch.setenv("FAKE_HELP", help_text)
+    rows, fieldnames = _annot_rows(n)
+    fieldnames = kw.pop("fieldnames", fieldnames)
+    work = tmp_path / "data_annotating.csv"
+    raw = tmp_path / "data_annotating_raw.jsonl"
+    schema = _parse_annotation_schema("label:choice[person,thing]")
+    _srv._annot_jobs["t"] = {"status": "starting", "total": n, "done": 0, "errors": [],
+                             "work_path": str(work), "tool": "claude", "cancelled": False}
+    _srv._annotation_job_worker("t", rows, fieldnames, list(range(n)), schema, str(work),
+                                "claude", str(fake), None, 30, raw_path=str(raw), **kw)
+    calls_file = tmp_path / "calls.jsonl"
+    calls = [json.loads(l) for l in open(calls_file)] if calls_file.exists() else []
+    lines = [json.loads(l) for l in open(raw)] if raw.exists() else []
+    _run_annot.job_line = next((l for l in lines if l.get("type") == "job"), None)
+    replies = [l for l in lines if l.get("type") != "job"]
+    return _srv._annot_jobs["t"], calls, rows, replies
+
+
+class TestAnnotationJob:
+    def test_call_sees_only_the_row(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "ok")
+        argv = calls[0]["argv"]
+        for flag in ("--safe-mode", "--strict-mcp-config", "--disable-slash-commands"):
+            assert flag in argv
+        assert argv[argv.index("--tools") + 1] == ""
+        assert argv[argv.index("--output-format") + 1] == "json"
+        # Claude Code's own system prompt is left out: an empty one instead
+        assert argv[argv.index("--system-prompt") + 1] == ""
+        assert "--append-system-prompt" not in argv
+        assert _run_annot.job_line["claude_code_prompt"] == "removed"
+        # An empty folder, not the project, and it is cleaned up afterwards
+        assert calls[0]["cwd_files"] == []
+        assert os.path.realpath(calls[0]["cwd"]) != os.path.realpath(os.getcwd())
+        assert not os.path.exists(calls[0]["cwd"])
+        assert calls[0]["api_key"] is True          # kept unless no_api_key
+        assert job["status"] == "complete" and rows[0]["label"] == "person"
+
+    def test_no_api_key_removes_every_anthropic_variable(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example")
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "ok")
+        assert calls[0]["anthropic_vars"] == ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"]
+        # The call log carries on from the first run, so look at the last call
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "ok", no_api_key=True)
+        assert calls[-1]["api_key"] is False
+        assert calls[-1]["anthropic_vars"] == []
+        assert rows[0]["label"] == "person"
+
+    def test_every_reply_is_kept_word_for_word(self, tmp_path, monkeypatch):
+        job, calls, rows, replies = _run_annot(tmp_path, monkeypatch, "ok", n=2)
+        assert [r["rows"] for r in replies] == [["1"], ["2"]]
+        assert all('"label": "person"' in r["stdout"].replace('\\"', '"') for r in replies)
+        import csv
+        saved = list(csv.DictReader(open(tmp_path / "data_annotating.csv")))
+        assert [r["label"] for r in saved] == ["person", "person"]
+
+    def test_bad_reply_is_asked_again(self, tmp_path, monkeypatch):
+        job, calls, rows, replies = _run_annot(tmp_path, monkeypatch, "bad_then_ok")
+        assert len(calls) == 2 and [r["try"] for r in replies] == [1, 2]
+        assert rows[0]["label"] == "person" and job["errors"] == []
+
+    def test_gives_up_after_three_tries(self, tmp_path, monkeypatch):
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "always_bad")
+        assert len(calls) == 3
+        assert job["status"] == "complete" and len(job["errors"]) == 1
+        assert rows[0]["label"] == ""
+
+    def test_usage_limit_stops_and_keeps_rows(self, tmp_path, monkeypatch):
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "limit", n=3)
+        assert job["status"] == "stopped_at_limit"
+        assert len(calls) == 1 and job["errors"] == [] and job["done"] == 0
+        assert "limit" in job["limit_message"]
+
+    def test_rate_limit_status_line_is_not_a_limit(self, tmp_path, monkeypatch):
+        # Claude Code's output always carries a rate-limit status event. A
+        # reply that is not JSON must be retried, not mistaken for the limit.
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "always_bad")
+        assert job["status"] == "complete" and len(calls) == 3
+
+    def test_batch_asks_again_only_for_missing_rows(self, tmp_path, monkeypatch):
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "batch_missing_one",
+                                         n=3, batch_size=3)
+        assert len(calls) == 2
+        assert calls[0]["prompt"].count('"_row"') == 3
+        assert calls[1]["prompt"].count('"_row"') == 1
+        assert [r["label"] for r in rows] == ["person"] * 3 and job["errors"] == []
+
+    def test_default_is_one_row_per_call(self, tmp_path, monkeypatch):
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "ok", n=3)
+        assert len(calls) == 3 and all('"_row"' not in c["prompt"] for c in calls)
+
+    def test_older_cli_without_the_flags_still_works(self, tmp_path, monkeypatch):
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "ok", help_text="")
+        assert calls[0]["argv"] == ["-p", "--no-session-persistence"]
+        assert rows[0]["label"] == "person"
+
+    def test_crash_marks_the_job_failed_and_keeps_the_file(self, tmp_path, monkeypatch):
+        work = tmp_path / "data_annotating.csv"
+        work.write_text("row_id,message,label,_schema\n1,message 1,,x\n")
+        # A field list missing a column makes the save fail.
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "ok",
+                                         fieldnames=["row_id", "message", "label"])
+        assert job["status"] == "failed"
+        assert work.read_text() == "row_id,message,label,_schema\n1,message 1,,x\n"
+
+    def test_instructions_are_the_whole_system_prompt(self, tmp_path, monkeypatch):
+        rules = "Label person when the message treats Claude as having a mind."
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "ok", n=2, instructions=rules)
+        for c in calls:
+            argv = c["argv"]
+            assert argv[argv.index("--system-prompt") + 1] == rules
+            assert "--append-system-prompt" not in argv
+            assert rules not in c["prompt"]
+        assert _run_annot.job_line["instructions"] == rules
+        assert _run_annot.job_line["instructions_sent_as"] == "system prompt"
+        assert _run_annot.job_line["claude_code_prompt"] == "removed"
+        assert [r["label"] for r in rows] == ["person", "person"]
+
+    def test_keeping_claude_codes_prompt_appends_the_instructions(self, tmp_path, monkeypatch):
+        rules = "Label person when the message treats Claude as having a mind."
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "ok", instructions=rules,
+                                         keep_claude_code_prompt=True)
+        argv = calls[0]["argv"]
+        assert argv[argv.index("--append-system-prompt") + 1] == rules
+        assert "--system-prompt" not in argv
+        assert _run_annot.job_line["claude_code_prompt"] == "kept"
+        assert _run_annot.job_line["instructions_sent_as"] == "system prompt"
+
+    def test_old_claude_code_keeps_its_prompt_and_says_so(self, tmp_path, monkeypatch):
+        rules = "Label person when the message treats Claude as having a mind."
+        help_old = FAKE_HELP.replace("--system-prompt <prompt>", "--something-else <x>")
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "ok", instructions=rules,
+                                         help_text=help_old)
+        argv = calls[0]["argv"]
+        assert argv[argv.index("--append-system-prompt") + 1] == rules
+        assert "--system-prompt" not in argv
+        assert _run_annot.job_line["claude_code_prompt"] == (
+            "kept (this Claude Code has no --system-prompt option)")
+        assert rows[0]["label"] == "person"
+
+    def test_instructions_in_the_prompt_once_without_the_option(self, tmp_path, monkeypatch):
+        rules = "Label person when the message treats Claude as having a mind."
+        help_without = (FAKE_HELP.replace("--append-system-prompt", "--something-else")
+                        .replace("--system-prompt <prompt>", "--something-else-too <x>"))
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "ok", n=3, batch_size=3,
+                                         instructions=rules, help_text=help_without)
+        assert len(calls) == 1
+        assert "--append-system-prompt" not in calls[0]["argv"]
+        assert "--system-prompt" not in calls[0]["argv"]
+        assert calls[0]["prompt"].count(rules) == 1
+        assert calls[0]["prompt"].startswith("Instructions for this task:")
+        assert _run_annot.job_line["instructions_sent_as"] == "prompt"
+
+    def test_no_instructions_leaves_the_prompt_as_before(self, tmp_path, monkeypatch):
+        job, calls, rows, _ = _run_annot(tmp_path, monkeypatch, "ok")
+        assert calls[0]["prompt"].startswith("Annotate the following data row.")
+        assert "--append-system-prompt" not in calls[0]["argv"]
+        assert _run_annot.job_line["instructions"] is None
+
+
+# --- wake_on_message: a background command that ends when mail arrives ----
+
+import subprocess as _sp
+
+
+def _board(home, session="s1"):
+    d = home / ".clauder_coord" / session
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _post(board, frm, body, to="all", typ="message"):
+    ev = {"ts": "2026-11-19T00:00:00.000", "from": frm, "type": typ, "to": to,
+          "body": {"text": body}}
+    with open(board / "events.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(ev) + "\n")
+
+
+def _waiter(home, agent="Claude", session="s1", *extra):
+    # Windows finds the home folder through USERPROFILE, not HOME
+    env = dict(os.environ, HOME=str(home), USERPROFILE=str(home))
+    return _sp.Popen([sys.executable, _srv.__file__, "wait", "--session", session,
+                      "--agent", agent, "--interval", "0.2", *extra],
+                     env=env, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True)
+
+
+def _finished(proc, within=10.0):
+    try:
+        out, _ = proc.communicate(timeout=within)
+        return out
+    except _sp.TimeoutExpired:
+        return None
+
+
+class TestWakeOnMessage:
+    def test_wakes_on_mail_for_it_and_ignores_the_rest(self, tmp_path):
+        board = _board(tmp_path)
+        _post(board, "Claude", "my own message")
+        _post(board, "beta", "still here", typ="heartbeat")
+        _post(board, "beta", "for gamma only", to="gamma")
+        proc = _waiter(tmp_path)
+        try:
+            time.sleep(1.5)
+            assert proc.poll() is None, proc.communicate()[0]
+            _post(board, "beta", "your turn, the model is fitted", to="Claude")
+            out = _finished(proc)
+            assert out is not None and proc.returncode == 0
+            assert "your turn, the model is fitted" in out and "check_messages" in out
+            assert "my own message" not in out and "for gamma only" not in out
+            # Nothing is marked read: the woken agent does that with check_messages
+            assert not (board / "cursor_Claude.txt").exists()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_messages_already_read_do_not_wake_it(self, tmp_path):
+        board = _board(tmp_path)
+        _post(board, "beta", "one")
+        _post(board, "beta", "two")
+        (board / "cursor_Claude.txt").write_text("2")
+        proc = _waiter(tmp_path)
+        try:
+            time.sleep(1.5)
+            assert proc.poll() is None
+            _post(board, "beta", "three")
+            out = _finished(proc)
+            assert out is not None and "three" in out and "] one" not in out
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_gives_up_after_its_timeout(self, tmp_path):
+        _board(tmp_path)
+        proc = _waiter(tmp_path, "Claude", "s1", "--timeout", "1")
+        out = _finished(proc, within=8)
+        assert out is not None and proc.returncode == 0 and "no message" in out
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="parent check is POSIX only")
+    def test_quits_when_what_started_it_goes_away(self, tmp_path):
+        _board(tmp_path)
+        env = dict(os.environ, HOME=str(tmp_path))
+        # A shell starts the waiter in the background and exits a second later
+        shell = _sp.run(["sh", "-c", '"$0" "$@" >/dev/null 2>&1 & echo $!; sleep 1',
+                         sys.executable, _srv.__file__, "wait", "--session", "s1",
+                         "--agent", "Claude", "--interval", "0.2"],
+                        env=env, capture_output=True, text=True, timeout=20)
+        pid = int(shell.stdout.strip())
+        deadline = time.time() + 8
+        alive = True
+        while time.time() < deadline and alive:
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.2)
+            except ProcessLookupError:
+                alive = False
+        assert not alive
+
+    def _bind(self, monkeypatch, home, agent="Claude"):
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(_srv, "_coord_target", lambda: (None, None))
+        monkeypatch.setattr(_srv, "get_r_addin_url", lambda: "http://127.0.0.1:1")
+        monkeypatch.setattr(_srv, "_target_session", "s1")
+        monkeypatch.setattr(_srv, "_agent_id", agent)
+        monkeypatch.setattr(_srv, "_agent_introduced", True)
+
+    def test_tool_gives_a_command_for_this_agent_and_session(self, tmp_path, monkeypatch):
+        self._bind(monkeypatch, tmp_path)
+        text = asyncio.run(_srv.call_tool("wake_on_message", {}))[0].text
+        assert "wait --session s1 --agent Claude" in text
+        assert "run_in_background" in text and "unread" not in text
+        persona = asyncio.run(_srv.call_tool("wake_on_message", {"as_agent": "Gemini"}))[0].text
+        assert "--agent Gemini" in persona
+        _post(_board(tmp_path), "beta", "waiting already")
+        text = asyncio.run(_srv.call_tool("wake_on_message", {}))[0].text
+        assert "already have 1 unread message" in text
+
+    def test_after_check_messages_it_waits_again(self, tmp_path, monkeypatch):
+        # The waiter and check_messages must agree on what is unread, or an
+        # agent would be woken over and over for mail it cannot find.
+        self._bind(monkeypatch, tmp_path)
+        board = _board(tmp_path)
+        _post(board, "beta", "handoff ready", to="Claude")
+        first = _waiter(tmp_path)
+        assert "handoff ready" in (_finished(first) or "")
+        read = " ".join(c.text for c in asyncio.run(_srv.call_tool("check_messages", {})))
+        assert "handoff ready" in read
+        again = _waiter(tmp_path)
+        try:
+            time.sleep(1.5)
+            assert again.poll() is None, again.communicate()[0]
+        finally:
+            if again.poll() is None:
+                again.kill()
+
+    def test_every_agent_is_told_about_it_on_its_first_call(self, monkeypatch):
+        async def no_info(return_info=False):
+            return None
+        monkeypatch.setattr(_srv, "check_addin_status", no_info)
+        intro = asyncio.run(_srv.get_agent_introduction())
+        assert "wake_on_message" in intro and "background" in intro
+        assert "do NOT set timers" in intro

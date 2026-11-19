@@ -61,7 +61,7 @@ The RStudio session has a single-threaded HTTP server. Multiple subagents callin
 
 - Use `execute_r` only for fast inspections: `class(x)`, `dim(df)`, `head(df)`, `ls()`.
 - Use `execute_r_async` with `inputs`/`outputs` marshaling for **everything else**: model fits, simulations, bulk transformations, EDA loops, anything iterating, anything fitting, anything plotting. No exceptions.
-- Poll for results with `get_async_result`. While waiting, do other work — read the ledger, plan the next step, draft your finding text.
+- Collect results with `get_async_result`, which waits until the job finishes. To do other work first (read the ledger, plan the next step, draft your finding text), check with `get_async_result(job_id, wait_s = 0)` and come back later.
 - If you need to cancel a runaway job, use `cancel_async_job`.
 
 If you find yourself wanting to `execute_r("fit <- brm(...)")` synchronously, **stop and use the async variant instead.** The orchestrator should call out subagents that violate this rule in the assembly phase.
@@ -179,6 +179,7 @@ Every working subagent MUST:
 
 **Before any major decision that depends on prior work:**
 - Re-read the ledger. Findings from other agents may have changed the landscape since you last looked.
+- Treat another agent's finding as a claim to check, not a fact. A ledger entry is that agent's summary of its work, and summaries drop things. Before you build on one, look at what actually ran: open the files and outputs its `Evidence` field names, inspect the objects in the session, and read the relevant part of the session log (`get_session_history`). If the record does not support the claim, say so in a new finding instead of building on it.
 
 **Findings are append-only.** You may NOT delete or overwrite a prior finding. If you discover a previous finding was wrong, append a new finding F-XXX with the correction, and update only the `Status:` field of the original entry to `Modified by F-XXX` or `Retracted by F-XXX`.
 
@@ -546,7 +547,7 @@ Anything failing (1)–(4) is automatic CONCERNS. Anything beyond is subjective 
 If you cannot dispatch subagents (your host CLI is single-agent only), tell the user this and offer two paths:
 
 1. **Sequential simulation:** You play each role in turn, following the same ledger discipline, with explicit transitions ("Now operating as EDA specialist..."). Slower, no parallelism, but the discipline and audit trail still produce useful artifacts.
-2. **Switch CLIs:** Suggest they re-run on a CLI that supports subagents (Claude Code's Task tool, Codex's `[agents]`, Gemini CLI's `/subagents`, Antigravity's `invoke_subagent`).
+2. **Switch CLIs:** Suggest they re-run on a CLI that supports subagents (Claude Code's Task tool, Codex's `[agents]`, Antigravity's `invoke_subagent`).
 
 In sequential mode, the assembly review still works — you just play every voting role yourself with explicit attempts to find concerns in each role's lens. This is weaker than true multi-agent assembly but better than nothing.
 

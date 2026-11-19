@@ -15,6 +15,7 @@ for (f in list.files("R", full.names = TRUE, pattern = "[.][rR]$")) {
 
 env <- new.env()
 sys.source("R/ui.R", envir = env)
+sys.source("R/terminal.R", envir = env)
 sys.source("R/checkpoints.R", envir = env)
 sys.source("R/notebook.R", envir = env)
 sys.source("R/codebook.R", envir = env)
@@ -142,7 +143,8 @@ r <- tryCatch({
   utils::write.csv(data.frame(id = 1:20, v = c(rnorm(18), NA, NA)),
                    file.path(proj, "d.csv"), row.names = FALSE)
   writeLines(c("library(jsonlite)",
-               paste0("d <- read.csv(\"", file.path(proj, "d.csv"), "\")"),
+               paste0("d <- read.csv(", encodeString(normalizePath(file.path(proj, "d.csv"),
+                         winslash = "/", mustWork = TRUE), quote = '"'), ")"),
                "saveRDS(d, \"out.rds\")"), file.path(proj, "a.R"))
   out <- suppressMessages(env$generate_codebook(proj))
   md <- readLines(out)
@@ -402,6 +404,36 @@ r <- tryCatch({
 }, error = function(e) conditionMessage(e))
 if (isTRUE(r)) pass("coordination v2: typed log, cursors, claims, consensus, no clobber") else fail("coordination:", r)
 
+# --- 13b. Fresh start sets the old message board aside ---
+r <- tryCatch({
+  cs <- "citest_fresh"
+  env$cr_send("old one", agent = "alpha", session = cs)
+  env$cr_send("old two", agent = "alpha", session = cs)
+  env$cr_ack(2L, agent = "beta", session = cs)
+  bdir <- env$coord_dir(cs)
+  before <- readLines(file.path(bdir, "events.jsonl"))
+
+  a <- env$archive_coord_board(cs)
+  moved <- file.path(a$dir, c("events.jsonl", "cursor_beta.txt"))
+  ok_move <- a$messages == 2L && all(file.exists(moved)) &&
+    identical(readLines(moved[1]), before) &&
+    !file.exists(file.path(bdir, "events.jsonl")) &&
+    length(list.files(bdir, pattern = "^cursor_")) == 0
+  # The new board starts at id 1, and beta, whose old position was 2,
+  # still gets the first new message
+  env$cr_send("new one", agent = "alpha", session = cs)
+  inbox <- env$cr_inbox(agent = "beta", session = cs)
+  ok_new <- nrow(inbox) == 1 && inbox$id == 1 && grepl("new one", inbox$body)
+  # A second fresh start keeps the first archive and adds another
+  b <- env$archive_coord_board(cs)
+  ok_again <- !identical(a$dir, b$dir) && file.exists(moved[1]) && b$messages == 1L
+  # Nothing to move: no archive folder is made
+  ok_empty <- is.null(env$archive_coord_board(cs))
+  ok_move && ok_new && ok_again && ok_empty
+}, error = function(e) conditionMessage(e))
+if (isTRUE(r)) pass("fresh start: old board moved aside, nothing deleted, new board readable") else fail("fresh start board:", r)
+
+
 # --- 14. reviewer2 stance ---
 r <- tryCatch({
   t1 <- capture.output(env$referee_prompt(stance = "reviewer2"))
@@ -533,6 +565,57 @@ r <- tryCatch({
 }, error = function(e) conditionMessage(e))
 if (isTRUE(r)) pass("format_coord_event: full body shown, no truncation") else fail("format_coord_event:", r)
 
+# --- 15b. Coordination echo: first event of a run is not swallowed ---
+r <- tryCatch({
+  ev <- function(ids) lapply(ids, function(i) list(id = i, from = "a", to = "all",
+                                                   type = "message", body = list(text = i)))
+  ids <- function(u) vapply(u$events, function(e) e$id, integer(1))
+  # Server started on an empty log (baseline 0): the very first event prints
+  u1 <- env$coord_unseen(ev(1L), env$coord_last_id(list()))
+  # Server started with 5 old events: only the 6th and later print
+  u2 <- env$coord_unseen(ev(1:7), env$coord_last_id(ev(1:5)))
+  # Folder deleted mid-run (seen was 15, log now has 2): both print
+  u3 <- env$coord_unseen(ev(1:2), 15L)
+  # Log emptied: nothing to print, and the baseline drops to 0
+  u4 <- env$coord_unseen(list(), 15L)
+  # No baseline recorded: skip what is there, print what comes after
+  u5 <- env$coord_unseen(ev(1:3), NULL)
+  u6 <- env$coord_unseen(ev(1:4), u5$seen)
+  identical(ids(u1), 1L) && u1$seen == 1L &&
+    identical(ids(u2), 6:7) && u2$seen == 7L &&
+    identical(ids(u3), 1:2) &&
+    length(u4$events) == 0 && u4$seen == 0L &&
+    length(u5$events) == 0 && identical(ids(u6), 4L)
+}, error = function(e) conditionMessage(e))
+if (isTRUE(r)) pass("coord_unseen: first event kept, history skipped, cleared log replays") else fail("coord_unseen:", r)
+
+# --- 15c. Plot capture never leaves a hidden file device open ---
+r <- if (!capabilities("png")) TRUE else tryCatch({
+  flaky <- new.env(); flaky$fail <- FALSE
+  registerS3method("drawDetails", "ci_flaky", function(x, recording) {
+    if (flaky$fail) stop("external pointer is not valid (simulated)")
+    grid::grid.rect()
+  }, envir = asNamespace("grid"))
+  grDevices::pdf(NULL); grDevices::dev.control("enable")
+  screen <- grDevices::dev.cur()
+  grid::grid.newpage(); grid::grid.draw(grid::grob(cl = "ci_flaky"))
+  before <- grDevices::dev.list()
+  # A copy that works writes the file and leaves the devices as they were
+  f1 <- tempfile(fileext = ".png")
+  env$copy_plot_to_file(grDevices::png, f1, width = 300, height = 200)
+  ok1 <- file.exists(f1) && file.info(f1)$size > 100 &&
+    identical(grDevices::dev.list(), before) && grDevices::dev.cur() == screen
+  # A copy whose replay fails still closes the device it opened
+  flaky$fail <- TRUE
+  failed <- inherits(tryCatch(env$copy_plot_to_file(grDevices::png, tempfile(fileext = ".png"),
+                                                    width = 300, height = 200),
+                              error = function(e) e), "error")
+  ok2 <- failed && identical(grDevices::dev.list(), before) && grDevices::dev.cur() == screen
+  grDevices::dev.off(screen)
+  ok1 && ok2
+}, error = function(e) conditionMessage(e))
+if (isTRUE(r)) pass("plot capture: failed copy closes its device, current device kept") else fail("plot capture device leak:", r)
+
 # --- 16. Editor tools: save-to-disk, line-count change, focus guard ---
 r <- tryCatch({
   f <- file.path(tempdir(), "clauder_edit_ci.R")
@@ -552,6 +635,56 @@ r <- tryCatch({
   length(disk) == 4 && any(grepl("b2 <- 22", disk, fixed = TRUE))
 }, error = function(e) conditionMessage(e))
 if (isTRUE(r)) pass("editor: line-count-changing splice persists to disk") else fail("editor splice:", r)
+
+# --- Console logging writes only into a running session's log ---
+# With the server stopped, log_file_path still names the previous session's
+# file; console entries must not be appended to a finished log.
+sys.source("R/console_log.R", envir = env)
+r <- tryCatch({
+  f <- tempfile(fileext = ".R")
+  env$.claude_server_env$settings <- list(log_to_file = TRUE, log_file_path = f)
+  env$.claude_server_env$running <- FALSE
+  stopped_null <- is.null(env$console_log_path())
+  env$.claude_server_env$running <- TRUE
+  env$console_write("x <- 1", tag = "user")
+  written <- identical(env$console_log_path(), f) &&
+    any(grepl("# Run by user (console):", readLines(f), fixed = TRUE))
+  env$.claude_server_env$running <- FALSE
+  env$.claude_server_env$settings <- NULL
+  unlink(f)
+  stopped_null && written
+}, error = function(e) conditionMessage(e))
+if (isTRUE(r)) pass("console log: written only while a session runs") else fail("console log path:", r)
+
+# --- Clean-script export drops code that failed, keeping it only as a comment ---
+r <- tryCatch({
+  log <- tempfile(fileext = ".R")
+  env$log_code_to_file("x <- 1", log, agent_id = "a")
+  env$log_code_to_file("stop('boom')", log, agent_id = "a")
+  env$log_error_to_file("stop('boom')", "boom", log, agent_id = "a")
+  env$log_code_to_file("y <- x + 1", log, agent_id = "a")
+  out <- suppressMessages(env$export_log_as_script(log, tempfile(fileext = ".R")))
+  s <- readLines(out)
+  unlink(c(log, out))
+  sum(s == "stop('boom')") == 0 && sum(s == "# stop('boom')") == 1 &&
+    "x <- 1" %in% s && "y <- x + 1" %in% s
+}, error = function(e) conditionMessage(e))
+if (isTRUE(r)) pass("export: failed code is commented, not left live") else fail("export of failed code:", r)
+
+# --- restore_session finds a checkpoint by the label it was saved with ---
+r <- tryCatch({
+  d <- tempfile(); dir.create(d)
+  e <- new.env()
+  assign("v", 1, e); suppressMessages(env$checkpoint_session("before_filter", envir = e, dir = d))
+  assign("v", 2, e)
+  suppressMessages(env$restore_session("before_filter", envir = e, dir = d))
+  got <- get("v", e)
+  miss <- tryCatch({ env$restore_session("nope", envir = e, dir = d); "no error" },
+                   error = function(x) conditionMessage(x))
+  unlink(d, recursive = TRUE)
+  got == 1 && grepl("Available:", miss)
+}, error = function(e) conditionMessage(e))
+if (isTRUE(r)) pass("checkpoints: restore by label") else fail("restore by label:", r)
 
 # --- 17. async progress sidecar and metadata ---
 if (requireNamespace("callr", quietly = TRUE)) {
@@ -597,6 +730,145 @@ r <- tryCatch({
 }, error = function(e) conditionMessage(e))
 if (isTRUE(r)) pass("install_cli: Copilot configuration") else
   fail("install_cli Copilot:", r)
+
+# --- start_server(): the server runs without the addin window ---
+# The shared start and stop are driven directly, with the home-folder pieces
+# pointed at a temp folder, and one real request goes over HTTP.
+r <- if (!all(vapply(c("httpuv", "fs", "ps", "callr"), requireNamespace, logical(1), quietly = TRUE)) ||
+         !nzchar(Sys.which("curl"))) "skip" else tryCatch(local({
+  home <- tempfile("termhome"); dir.create(home)
+  on.exit(unlink(home, recursive = TRUE), add = TRUE)
+  env$startServer <- httpuv::startServer; env$stopServer <- httpuv::stopServer
+  env$fromJSON <- jsonlite::fromJSON; env$toJSON <- jsonlite::toJSON
+  env$discovery_dir <- function() file.path(home, "sessions")
+  # 所有消息板也隔离到测试目录，不读取或归档用户的实际会话。
+  env$coord_dir <- function(session = NULL) {
+    if (is.null(session)) session <- env$.claude_server_env$session_name
+    if (is.null(session) || !nzchar(session)) session <- "default"
+    d <- file.path(home, "coord", gsub("[^a-zA-Z0-9_-]", "_", session))
+    dir.create(d, recursive = TRUE, showWarnings = FALSE)
+    d
+  }
+  ci_settings <- list(print_to_console = FALSE, log_to_file = FALSE,
+                      log_file_path = file.path(home, "log.R"), require_token = FALSE,
+                      plot_auto = TRUE, tool_sets = NULL)
+  env$load_claude_settings <- function() ci_settings
+  env$save_claude_settings <- function(settings) invisible(NULL)
+  st <- env$.claude_server_env
+  on.exit(try(env$server_stop(), silent = TRUE), add = TRUE, after = FALSE)
+  st$settings <- ci_settings
+  st$headless <- TRUE
+  port <- httpuv::randomPort()
+  device_before <- getOption("device")
+
+  started <- env$server_start(" ci_term ", port)
+  rec <- jsonlite::fromJSON(file.path(home, "sessions", "ci_term.json"))
+  ok_start <- isTRUE(st$running) && identical(started$session_name, "ci_term") &&
+    is.null(started$log_file_path)
+  # No editor in a terminal, so the editor tools are not offered
+  ok_rec <- identical(rec$frontend, "terminal") && !("editor" %in% rec$tool_sets) &&
+    all(c("core", "coord") %in% rec$tool_sets) && rec$pid == Sys.getpid()
+
+  # 公开入口必须拒绝同一 R 进程中的第二次启动，且保留原服务与身份。
+  active_server <- st$server; active_token <- st$token
+  duplicate <- tryCatch(env$start_server("ci_duplicate", port, block = FALSE,
+                                         fresh_start = TRUE), error = function(e) e)
+  ok_duplicate <- inherits(duplicate, "error") &&
+    grepl("already running in this session", conditionMessage(duplicate), fixed = TRUE) &&
+    identical(st$server, active_server) && identical(st$token, active_token) &&
+    identical(st$session_name, "ci_term") && isTRUE(st$running)
+  stopifnot(ok_duplicate)
+  pass("start_server: duplicate public start preserves the active server")
+
+  # One real request, answered while this script pumps the event loop
+  body <- file.path(home, "body.json"); out <- file.path(home, "reply.json")
+  writeLines('{"code": "ci_term_x <- 20 + 22; ci_term_x", "agent_id": "ci"}', body)
+  system2("curl", c("-s", "-m", "20", "-X", "POST", "-H", "Content-Type:application/json",
+                    "--data-binary", paste0("@", body), "-o", out,
+                    sprintf("http://127.0.0.1:%d", port)), wait = FALSE)
+  deadline <- Sys.time() + 20
+  while (Sys.time() < deadline && !(file.exists(out) && file.info(out)$size > 0)) {
+    httpuv::service(100)
+  }
+  reply <- jsonlite::fromJSON(out)
+  ok_http <- isTRUE(reply$success) && grepl("42", reply$output, fixed = TRUE) &&
+    identical(get("ci_term_x", envir = .GlobalEnv), 42)
+
+  # With no screen, a hidden device stands in and a plot can be copied from it
+  ok_plot <- if (!capabilities("png")) TRUE else {
+    swapped <- env$use_offscreen_device()
+    graphics::plot(1:3)
+    on_hidden <- env$is_screen_device()
+    f <- tempfile(fileext = ".png")
+    env$copy_plot_to_file(grDevices::png, f, width = 300, height = 200)
+    isTRUE(swapped) && on_hidden && file.exists(f) && file.info(f)$size > 100
+  }
+  opened <- grDevices::dev.list()
+
+  env$server_stop()
+  ok_stop <- !isTRUE(st$running) && is.null(st$headless) &&
+    !file.exists(file.path(home, "sessions", "ci_term.json")) &&
+    identical(getOption("device"), device_before) &&
+    (is.null(opened) || !any(opened %in% grDevices::dev.list()))
+  stopifnot(ok_start, ok_rec, ok_http, ok_plot, ok_stop)
+  pass("start_server: first HTTP round trip and clean stop")
+
+  # 单独验证原端口立即复用，不通过换端口或等待掩盖释放问题。
+  restarted <- env$server_start("ci_restart", port)
+  stopifnot(isTRUE(st$running), identical(restarted$port, port))
+  env$server_stop()
+  pass("start_server: immediate same-port restart")
+
+  # A name already owned by a live process is refused and nothing is left running
+  # PID 1 在 Windows 并不保证存在；仅使用本测试拥有的已知存活子进程。
+  owner <- callr::r_bg(function() Sys.sleep(60))
+  on.exit(if (owner$is_alive()) { owner$kill(); owner$wait(5000) },
+          add = TRUE, after = FALSE)
+  stopifnot(owner$is_alive(), isTRUE(env$pid_is_alive(owner$get_pid())))
+  dir.create(file.path(home, "sessions"), showWarnings = FALSE)
+  jsonlite::write_json(list(session_name = "taken", port = 1L, pid = owner$get_pid(),
+                            token = "x", started_at = "2026-01-01T00:00:00"),
+                       file.path(home, "sessions", "taken.json"), auto_unbox = TRUE)
+  taken_record <- readLines(file.path(home, "sessions", "taken.json"))
+  refused <- tryCatch(env$server_start("taken", port), error = function(e) e)
+  ok_taken <- inherits(refused, "error") &&
+    grepl("already owned by a live or unknown process", conditionMessage(refused), fixed = TRUE) &&
+    !isTRUE(st$running) && is.null(st$server) && owner$is_alive() &&
+    identical(taken_record, readLines(file.path(home, "sessions", "taken.json")))
+  stopifnot(ok_taken)
+  pass("start_server: known live child name is refused and its record survives")
+
+  # A fresh start on that taken name is refused too, and its board is left alone
+  env$cr_send("live session's message", agent = "owner", session = "taken")
+  taken_log <- file.path(env$coord_dir("taken"), "events.jsonl")
+  taken_board <- readLines(taken_log)
+  refused_fresh <- tryCatch(suppressMessages(env$server_start("taken", port, fresh_start = TRUE)),
+                            error = function(e) e)
+  ok_taken_board <- inherits(refused_fresh, "error") &&
+    grepl("already owned by a live or unknown process", conditionMessage(refused_fresh), fixed = TRUE) &&
+    file.exists(taken_log) && identical(taken_board, readLines(taken_log)) &&
+    !dir.exists(file.path(env$coord_dir("taken"), "archive")) && !isTRUE(st$running) &&
+    owner$is_alive()
+  stopifnot(ok_taken_board)
+  pass("start_server: live child fresh-start refusal preserves its board")
+
+  # A fresh start on a free name moves its old board aside and says where
+  env$cr_send("from an earlier run", agent = "old", session = "ci_fresh")
+  fresh <- suppressMessages(env$server_start("ci_fresh", port, fresh_start = TRUE))
+  ok_fresh <- !is.null(fresh$board_archive) &&
+    file.exists(file.path(fresh$board_archive, "events.jsonl")) &&
+    length(env$coord_events(session = "ci_fresh")) == 0 && isTRUE(st$running)
+  env$server_stop()
+  stopifnot(ok_fresh)
+  pass("start_server: same-port fresh start after collision rollback")
+
+  ok_start && ok_rec && ok_duplicate && ok_http && ok_plot && ok_stop && ok_taken && ok_taken_board && ok_fresh
+}), error = function(e) conditionMessage(e))
+if (identical(r, "skip")) {
+  pass("start_server: skipped (needs httpuv, fs, ps, callr and curl)")
+} else if (isTRUE(r)) {
+  pass("start_server: serves a request, leaves out editor tools, hidden plot device, clean stop")
+} else fail("start_server round trip:", r)
 
 if (!ok) quit(status = 1)
 cat("\nAll checks passed.\n")

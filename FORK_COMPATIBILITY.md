@@ -4,8 +4,9 @@ This repository is a fork of [IMNMV/ClaudeR](https://github.com/IMNMV/ClaudeR),
 not the upstream release channel. The original upstream README below remains
 available for its general tool documentation.
 
-The workbench compatibility line uses R package `0.14.1.9002` and bridge
-`0.14.5.post1`, intended for tag `v0.14.1.9002-lzhs.1`. Install both halves from
+The workbench compatibility line uses R package `0.16.6.9001` and bridge
+`0.16.6.post1` based on full upstream commit
+`3b56327527919b307b5466c3647ecb004e27775f`. Install both halves from
 the same immutable tag, then install
 [clauder-rstudio-workbench](https://github.com/lzhs1995/clauder-rstudio-workbench).
 Do not mix this R package with a bare PyPI `uvx clauder-mcp` invocation.
@@ -44,3 +45,12 @@ change code already loaded in a running R/Python process.
 These safeguards address reproducible failure modes; they do not promise that
 an external MCP host can never fail or attribute an unknown historical config
 write to a particular program.
+
+## Full-upgrade candidate
+
+All upstream features are retained, including the Python companion, Positron,
+annotation batching, async wait, coordination, clean-script export, checkpoint
+restore, RNG-preserving output naming and plot device cleanup. One deliberate
+policy difference remains: a changed same-name session identity requires an
+explicit `connect_session` after inspection; it never silently rebinds code.
+Candidate tests and installation are isolated from existing research sessions.

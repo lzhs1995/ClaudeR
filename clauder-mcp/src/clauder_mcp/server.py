@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # persistent_r_mcp.py
 
+import os
+import sys
+
+# Capture the launcher before importing the MCP stack on slow machines.
+_wait_parent_pid = os.getppid() if sys.argv[1:2] == ["wait"] else None
+
 import argparse
 import asyncio
 import json
 import tempfile
-import os
 import base64
 import uuid
 import re
@@ -14,7 +19,6 @@ import subprocess
 import threading
 from typing import Any, Dict, List, Optional
 import httpx
-import sys
 from datetime import datetime
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -47,6 +51,10 @@ _agent_id_source: str = "unset"       # Where the identity came from (for the in
 _target_session: Optional[str] = None  # Set by connect_session tool
 _target_token: Optional[str] = None    # Per-session auth token from the discovery file
 _target_identity = None              # PID/port/start/token captured at explicit binding
+# Set when the bound session turns out to have been restarted, and cleared once
+# the notice has been shown on a tool result. The agent's picture of the
+# environment is stale after a restart, and it has to be told.
+_rebind_note: Optional[str] = None
 _agent_introduced: bool = False        # First-call introduction flag
 
 # Cache variable to store the result of the ggplot2 check
@@ -136,7 +144,7 @@ def _session_identity(info):
 
 def get_r_addin_url() -> Optional[str]:
     """Fail closed after binding; never route a lost target to another R session."""
-    global _target_session, _target_token, _target_identity
+    global _target_session, _target_token, _target_identity, _rebind_note
     sessions = discover_sessions()
     if _target_session:
         matches = [s for s in sessions if s["session_name"] == _target_session]
@@ -158,6 +166,23 @@ def get_r_addin_url() -> Optional[str]:
     _target_identity = _session_identity(pick)
     _target_token = pick.get("token")
     return f"http://127.0.0.1:{pick['port']}"
+
+
+def _session_info() -> Optional[Dict[str, Any]]:
+    """Fresh settings only for the uniquely identifiable execution target."""
+    try:
+        sessions = discover_sessions()
+        if _target_session:
+            matches = [s for s in sessions if s.get("session_name") == _target_session]
+            if len(matches) != 1:
+                return None
+            pick = matches[0]
+            if _target_identity is not None and _session_identity(pick) != _target_identity:
+                return None
+            return pick
+        return sessions[0] if len(sessions) == 1 else None
+    except Exception:
+        return None
 
 
 def _auth_headers() -> Dict[str, str]:
@@ -212,9 +237,20 @@ def escape_r_string(s: str) -> str:
     return s
 
 # Function to execute R code via the HTTP addin
-async def execute_r_code_via_addin(code: str) -> Dict[str, Any]:
-    """Execute R code through the RStudio addin HTTP server."""
-    url = get_r_addin_url()
+async def execute_r_code_via_addin(code: str, want_plot: bool = False) -> Dict[str, Any]:
+    """Execute R code through the RStudio addin HTTP server.
+
+    want_plot=True is execute_r_with_plot asking explicitly; it overrides the
+    session's plot_auto setting. Older R servers ignore the field and return
+    the plot as before.
+    """
+    try:
+        url = get_r_addin_url()
+    except SessionBindingError as exc:
+        # Binding is refused, not broken. Return it as a normal tool result so
+        # the agent can act on it; raising here surfaces as an opaque internal
+        # error instead of "pick a session".
+        return {"success": False, "error": str(exc)}
     if url is None:
         return {
             "success": False,
@@ -222,6 +258,8 @@ async def execute_r_code_via_addin(code: str) -> Dict[str, Any]:
         }
     try:
         payload: Dict[str, Any] = {"code": code}
+        if want_plot:
+            payload["want_plot"] = True
         if _agent_id:
             payload["agent_id"] = _agent_id
         async with httpx.AsyncClient() as client:
@@ -248,7 +286,10 @@ async def execute_r_code_via_addin(code: str) -> Dict[str, Any]:
 
 async def post_to_r_addin(payload: Dict[str, Any], timeout: float = 10.0) -> Dict[str, Any]:
     """Send an arbitrary JSON payload to the R addin HTTP server."""
-    url = get_r_addin_url()
+    try:
+        url = get_r_addin_url()
+    except SessionBindingError as exc:
+        return {"success": False, "error": str(exc)}
     if url is None:
         return {"success": False, "error": "No R sessions found. Start the ClaudeR addin in RStudio first."}
     try:
@@ -318,7 +359,12 @@ async def check_addin_status(return_info: bool = False):
     """Check if the RStudio addin is running.
     If return_info is True, returns the full status dict or None.
     Otherwise returns a bool."""
-    url = get_r_addin_url()
+    try:
+        url = get_r_addin_url()
+    except SessionBindingError:
+        # Status is a question, not a command: an ambiguous binding means "not
+        # usable right now", which is what False/None already communicates.
+        return None if return_info else False
     if url is None:
         return None if return_info else False
     try:
@@ -386,6 +432,11 @@ async def get_agent_introduction() -> str:
     lines.append("'Claude-Stasis') BEFORE other work, so history and messages carry a name")
     lines.append("your partners recognize instead of the random id above.")
     lines.append("")
+    lines.append("Waiting on another agent: do NOT set timers or keep calling check_messages.")
+    lines.append("Call wake_on_message once and run the command it gives you as a background")
+    lines.append("command. It finishes when a message for you arrives, and your app wakes you.")
+    lines.append("Then check_messages and start it again. Keep one running while you wait.")
+    lines.append("")
     lines.append("Safety: call checkpoint_session before risky changes (overwrites, removals,")
     lines.append("destructive transformations); restore_session rolls the environment back.")
     lines.append("")
@@ -403,7 +454,12 @@ async def get_agent_introduction() -> str:
 # wait_for_message can long-poll without a single R roundtrip.
 
 def _coord_dir() -> str:
-    get_r_addin_url()  # latch a session if not bound yet
+    # Latch a session if not bound yet. An ambiguous binding must not stop
+    # coordination: the directory is derived from the name we already hold.
+    try:
+        get_r_addin_url()
+    except SessionBindingError:
+        pass
     session = _target_session or "default"
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", session)
     d = os.path.join(_home_dir(), ".clauder_coord", safe)
@@ -436,7 +492,10 @@ def _coord_append(ev_type: str, body: Any, to: str = "all",
 
 
 def _coord_events() -> List[Dict[str, Any]]:
-    path = _coord_log_path()
+    return _read_events(_coord_log_path())
+
+
+def _read_events(path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
         return []
     out = []
@@ -460,8 +519,12 @@ def _coord_cursor_path(as_agent: Optional[str] = None) -> str:
 
 
 def _coord_cursor(as_agent: Optional[str] = None) -> int:
+    return _read_cursor(_coord_cursor_path(as_agent))
+
+
+def _read_cursor(path: str) -> int:
     try:
-        with open(_coord_cursor_path(as_agent)) as f:
+        with open(path) as f:
             return int(f.read().strip())
     except (OSError, ValueError):
         return 0
@@ -479,11 +542,7 @@ def _coord_unread(from_agent: Optional[str] = None,
     me = as_agent or _agent_id
     out = []
     for ev in _coord_events():
-        if ev["id"] <= cur or ev.get("from") == me:
-            continue
-        if ev.get("to") not in ("all", me):
-            continue
-        if ev.get("type") == "heartbeat":
+        if not _is_unread_for(ev, cur, me):
             continue
         if from_agent and ev.get("from") != from_agent:
             continue
@@ -491,6 +550,100 @@ def _coord_unread(from_agent: Optional[str] = None,
             continue
         out.append(ev)
     return out
+
+
+def _is_unread_for(ev: Dict[str, Any], cur: int, me: Optional[str]) -> bool:
+    """What check_messages counts as unread for `me`. The waiter uses the same
+    test, so it can never wake an agent for something check_messages then
+    says is not there."""
+    return (ev["id"] > cur and ev.get("from") != me
+            and ev.get("to") in ("all", me) and ev.get("type") != "heartbeat")
+
+
+# --- Wake-up waiter: `clauder-mcp wait` ---
+# MCP gives a server no way to start a model turn. Claude Code and Antigravity
+# act only when the person writes or when something the agent started comes
+# back. Both wake the agent when a command it left running in the background
+# finishes, so the waiter is a plain command: it watches the board's files and
+# exits the moment something unread arrives for one agent, and the agent's own
+# app turns that exit into a wake-up. It never moves the read cursor, so
+# nothing is marked read unseen: the woken agent reads with check_messages,
+# which does. An agent that starts it again without reading is woken again at
+# once, which is the safe way to fail.
+
+def _wake_command(session: str, agent: str, timeout_s: float = 0) -> str:
+    """The shell command that runs this file's waiter for `agent`."""
+    argv = [sys.executable, os.path.abspath(__file__), "wait",
+            "--session", session, "--agent", agent]
+    if timeout_s and timeout_s > 0:
+        argv += ["--timeout", str(int(timeout_s))]
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(argv)
+    import shlex
+    return shlex.join(argv)
+
+
+def _file_key(path: str):
+    try:
+        st = os.stat(path)
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _wait_main(argv: List[str]) -> int:
+    import time
+    parser = argparse.ArgumentParser(
+        prog="clauder-mcp wait",
+        description=("Wait until a coordination message for AGENT arrives on "
+                     "SESSION's board, then exit. Run it as a background command, "
+                     "so the app that started it wakes the agent when it finishes."))
+    parser.add_argument("--session", required=True)
+    parser.add_argument("--agent", required=True)
+    parser.add_argument("--timeout", type=float, default=0.0,
+                        help=("Give up after this many seconds. 0, the default, waits "
+                              "until a message comes or whatever started it goes away."))
+    parser.add_argument("--interval", type=float, default=1.0, help=argparse.SUPPRESS)
+    a = parser.parse_args(argv)
+
+    board = os.path.join(_home_dir(), ".clauder_coord",
+                         re.sub(r"[^a-zA-Z0-9_-]", "_", a.session))
+    log = os.path.join(board, "events.jsonl")
+    cursor = os.path.join(board, "cursor_" + re.sub(r"[^a-zA-Z0-9_-]", "_", a.agent) + ".txt")
+    parent = _wait_parent_pid if _wait_parent_pid is not None else os.getppid()
+    started = time.monotonic()
+    seen = None
+    try:
+        while True:
+            # Parse the log only when it or the cursor changed: a long board
+            # read every second by several waiters would be wasted work.
+            key = (_file_key(log), _file_key(cursor))
+            if key != seen:
+                seen = key
+                cur = _read_cursor(cursor)
+                unread = [ev for ev in _read_events(log) if _is_unread_for(ev, cur, a.agent)]
+                if unread:
+                    n = len(unread)
+                    print(f"ClaudeR: {n} new coordination message{'' if n == 1 else 's'} "
+                          f"for {a.agent} on session '{a.session}':")
+                    for ev in unread[-10:]:
+                        line = _coord_format([ev])
+                        print(line if len(line) <= 300 else line[:300] + " ...")
+                    if n > 10:
+                        print(f"(and {n - 10} earlier)")
+                    print("Read them with check_messages, which marks them read. Then run "
+                          "this same command again in the background to keep listening.")
+                    return 0
+            if a.timeout and time.monotonic() - started >= a.timeout:
+                print(f"ClaudeR: no message for {a.agent} on session '{a.session}' within "
+                      f"{round(a.timeout)} s. Run the same command again to keep listening.")
+                return 0
+            # Whatever started the waiter has gone, so nobody is left to wake.
+            if sys.platform != "win32" and os.getppid() != parent:
+                return 0
+            time.sleep(max(a.interval, 0.2))
+    except KeyboardInterrupt:
+        return 130
 
 
 def _coord_format(events: List[Dict[str, Any]]) -> str:
@@ -549,8 +702,8 @@ def _find_cli_path(tool: str) -> Optional[str]:
     return shutil.which(tool)
 
 
-def _build_subprocess_prompt(row: Dict, schema: Dict[str, Any], annot_fields: List[str]) -> str:
-    """Build a lean one-shot prompt for a single row annotation subprocess."""
+def _annotation_field_lines(schema: Dict[str, Any]) -> List[str]:
+    """One line per field to annotate, describing what values it takes."""
     field_lines = []
     for field, spec in schema.items():
         t, constraint = spec["type"], spec["constraint"]
@@ -563,19 +716,130 @@ def _build_subprocess_prompt(row: Dict, schema: Dict[str, Any], annot_fields: Li
             field_lines.append(f"- {field}: true or false")
         else:
             field_lines.append(f"- {field}: text (can be empty string \"\")")
+    return field_lines
 
+
+def _instructions_block(instructions: Optional[str]) -> str:
+    """The task's instructions at the top of a prompt, when they are not sent as
+    a system prompt."""
+    return f"Instructions for this task:\n{instructions}\n\n" if instructions else ""
+
+
+def _build_subprocess_prompt(row: Dict, schema: Dict[str, Any], annot_fields: List[str],
+                             instructions: Optional[str] = None) -> str:
+    """Build a lean one-shot prompt for a single row annotation subprocess."""
+    field_lines = _annotation_field_lines(schema)
     row_data = {k: v for k, v in row.items() if k not in annot_fields and k != "_schema"}
     row_json = json.dumps(row_data, ensure_ascii=False, indent=2)
     field_names = list(schema.keys())
 
     return (
-        "Annotate the following data row.\n"
+        _instructions_block(instructions)
+        + "Annotate the following data row.\n"
         "Return ONLY a valid JSON object — no explanation, no markdown, no code blocks.\n\n"
         "Fields to annotate:\n"
         + "\n".join(field_lines)
         + f"\n\nRow:\n{row_json}\n\n"
         f"Return a JSON object with exactly these keys: {field_names}"
     )
+
+
+def _build_batch_prompt(items: List[tuple], schema: Dict[str, Any], annot_fields: List[str],
+                        instructions: Optional[str] = None) -> str:
+    """Prompt for several rows in one call (batch_size > 1). Each row carries a _row
+    key, and the reply maps each key to that row's annotation."""
+    field_lines = _annotation_field_lines(schema)
+    row_lines = []
+    for key, row in items:
+        row_data = {k: v for k, v in row.items() if k not in annot_fields and k != "_schema"}
+        row_lines.append(json.dumps({"_row": key, **row_data}, ensure_ascii=False))
+    keys = [key for key, _ in items]
+    return (
+        _instructions_block(instructions)
+        + "Annotate each data row below. Judge every row on its own, as if it were the only one.\n"
+        "Return ONLY a valid JSON object. No explanation, no markdown, no code blocks.\n\n"
+        "Fields to annotate:\n"
+        + "\n".join(field_lines)
+        + "\n\nRows (one JSON object per line, each with a _row key):\n"
+        + "\n".join(row_lines)
+        + f"\n\nReturn one JSON object whose keys are these _row values: {keys}. "
+        f"Map each to an object with exactly these keys: {list(schema.keys())}"
+    )
+
+
+# How many times a row (or a batch) is asked before it is recorded as an error.
+_ANNOT_TRIES = 3
+
+# What the CLIs say when a plan's usage limit is hit. Only looked for in a call
+# that failed, so a row whose own text mentions a limit is not mistaken for one.
+_ANNOT_LIMIT_RE = re.compile(
+    r"usage limit|hit your (?:usage )?limit|limit reached|limit will reset|resets? at|"
+    r"quota exceeded|exceeded your (?:current )?quota|rate limit",
+    re.IGNORECASE,
+)
+
+# Removed from a call's environment when no_api_key is set, so the CLI uses the
+# subscription login and never bills an API key. Names or prefixes: every
+# ANTHROPIC_* variable goes for Claude, so no key, token or custom base URL
+# reaches the call.
+_ANNOT_API_KEYS = {
+    "claude": ("ANTHROPIC_",),
+    "codex": ("OPENAI_API_KEY", "CODEX_API_KEY"),
+}
+
+_claude_help_cache: Dict[str, str] = {}
+
+
+def _claude_has_flag(tool_path: str, flag: str) -> bool:
+    """Whether this Claude Code's --help lists the flag. Older versions lack
+    some, and an unknown flag makes the CLI refuse to run at all."""
+    if tool_path not in _claude_help_cache:
+        try:
+            _claude_help_cache[tool_path] = subprocess.run(
+                [tool_path, "--help"], capture_output=True, text=True, timeout=30).stdout or ""
+        except Exception:
+            _claude_help_cache[tool_path] = ""
+    help_text = _claude_help_cache[tool_path]
+    return re.search(r"(?:^|\s)" + re.escape(flag) + r"(?=[\s<=,]|$)", help_text, re.M) is not None
+
+
+def _claude_lockdown_flags(tool_path: str) -> List[str]:
+    """Flags that leave a labelling call with nothing but its prompt: no tools,
+    MCP servers, hooks, CLAUDE.md or slash commands. Installed plugins are still
+    listed by the CLI but have nothing to run through. Only flags this CLI's
+    --help lists are used, so an older Claude Code still runs. Claude Code's
+    own system prompt is dealt with in _annotation_call."""
+    def has(flag: str) -> bool:
+        return _claude_has_flag(tool_path, flag)
+
+    flags: List[str] = []
+    if has("--safe-mode"):
+        flags.append("--safe-mode")
+    elif has("--settings"):
+        flags += ["--settings", '{"disableAllHooks": true}']
+    if has("--tools"):
+        flags += ["--tools", ""]
+    if has("--strict-mcp-config"):
+        flags.append("--strict-mcp-config")
+    if has("--disable-slash-commands"):
+        flags.append("--disable-slash-commands")
+    if has("--output-format"):
+        flags += ["--output-format", "json"]
+    return flags
+
+
+def _claude_code_prompt_label(tool: str, tool_path: str, keep: bool) -> Optional[str]:
+    """What becomes of Claude Code's own system prompt in a labelling call:
+    "removed" (the default: the call runs with no system prompt beyond the
+    task's instructions), "kept" when asked for, or kept because this Claude
+    Code has no --system-prompt option. None for the other backends."""
+    if tool != "claude":
+        return None
+    if keep:
+        return "kept"
+    if _claude_has_flag(tool_path, "--system-prompt"):
+        return "removed"
+    return "kept (this Claude Code has no --system-prompt option)"
 
 
 def _extract_json(text: str) -> Optional[Dict]:
@@ -602,32 +866,54 @@ def _extract_json(text: str) -> Optional[Dict]:
     return None
 
 
-def _run_subprocess_row(
+def _annotation_call(
     prompt: str, tool: str, tool_path: str,
     model: Optional[str], timeout: int, reasoning_effort: str = "high",
-    ollama_base_url: str = "http://localhost:11434"
-) -> tuple:
-    """Run a single annotation subprocess (or HTTP call for ollama). Returns (result_dict or None, raw_output, error_msg)."""
+    ollama_base_url: str = "http://localhost:11434",
+    workdir: Optional[str] = None, env: Optional[Dict[str, str]] = None,
+    system_text: Optional[str] = None, replace_system: bool = False
+) -> Dict[str, Any]:
+    """One annotation call: a fresh CLI process, or an HTTP call for ollama.
+
+    For Claude, system_text is appended to Claude Code's own system prompt, or,
+    with replace_system, is the whole system prompt (empty when None), so
+    Claude Code's own is left out.
+
+    Returns a dict with the model's reply ("text"), the backend's whole output
+    word for word ("stdout", "stderr", "returncode"), an error message or None,
+    and "limit", True when the failure was the plan's usage limit."""
+    out: Dict[str, Any] = {"text": "", "stdout": "", "stderr": "", "returncode": None,
+                           "error": None, "limit": False}
     try:
         if tool == "claude":
-            command = [tool_path, "-p", "--no-session-persistence"]
+            command = [tool_path, "-p", "--no-session-persistence"] + _claude_lockdown_flags(tool_path)
             if model:
                 command.extend(["--model", model])
+            if replace_system:
+                # The whole system prompt: the instructions, or nothing at all.
+                command.extend(["--system-prompt", system_text or ""])
+            elif system_text:
+                command.extend(["--append-system-prompt", system_text])
             completed = subprocess.run(
                 command, input=prompt, text=True,
-                capture_output=True, timeout=timeout
+                capture_output=True, timeout=timeout, cwd=workdir, env=env
             )
-            output = completed.stdout
-
-        elif tool == "gemini":
-            command = [tool_path, "-p", prompt]
-            if model:
-                command.extend(["-m", model])
-            completed = subprocess.run(
-                command, text=True,
-                capture_output=True, timeout=timeout
-            )
-            output = completed.stdout
+            out.update(stdout=completed.stdout, stderr=completed.stderr,
+                       returncode=completed.returncode, text=completed.stdout)
+            if "--output-format" in command:
+                # The JSON result holds the reply in "result" and flags failures.
+                # Some setups print every event as a list, with the result last.
+                try:
+                    envelope = json.loads(completed.stdout)
+                    if isinstance(envelope, list):
+                        envelope = next((e for e in reversed(envelope)
+                                         if isinstance(e, dict) and e.get("type") == "result"), None)
+                    if isinstance(envelope, dict) and "result" in envelope:
+                        out["text"] = str(envelope.get("result") or "")
+                        if envelope.get("is_error"):
+                            out["error"] = f"Claude Code error: {out['text'][:300]}"
+                except Exception:
+                    pass
 
         elif tool == "agy":
             # Antigravity CLI. -p is an alias for --print (headless one-shot).
@@ -637,9 +923,10 @@ def _run_subprocess_row(
                 command.extend(["--model", model])
             completed = subprocess.run(
                 command, text=True,
-                capture_output=True, timeout=timeout
+                capture_output=True, timeout=timeout, env=env
             )
-            output = completed.stdout
+            out.update(stdout=completed.stdout, stderr=completed.stderr,
+                       returncode=completed.returncode, text=completed.stdout)
 
         elif tool == "qwen":
             command = [tool_path, "--prompt", prompt]
@@ -647,9 +934,10 @@ def _run_subprocess_row(
                 command.extend(["--model", model])
             completed = subprocess.run(
                 command, text=True,
-                capture_output=True, timeout=timeout
+                capture_output=True, timeout=timeout, env=env
             )
-            output = completed.stdout
+            out.update(stdout=completed.stdout, stderr=completed.stderr,
+                       returncode=completed.returncode, text=completed.stdout)
 
         elif tool == "ollama":
             # No subprocess; POST to Ollama's HTTP API. format=json puts the model in
@@ -667,15 +955,17 @@ def _run_subprocess_row(
                 with httpx.Client(timeout=timeout) as client:
                     resp = client.post(f"{ollama_base_url.rstrip('/')}/api/generate", json=payload)
                     resp.raise_for_status()
-                    output = resp.json().get("response", "")
+                    out["stdout"] = resp.text
+                    out["text"] = resp.json().get("response", "")
             except httpx.ConnectError:
-                return None, "", (
+                out["error"] = (
                     f"Could not reach Ollama at {ollama_base_url}. "
                     f"Is `ollama serve` running? Or set ollama_base_url to a different host."
                 )
             except httpx.HTTPStatusError as e:
                 body = (e.response.text or "")[:300]
-                return None, "", f"Ollama returned HTTP {e.response.status_code}: {body}"
+                out["stdout"] = e.response.text or ""
+                out["error"] = f"Ollama returned HTTP {e.response.status_code}: {body}"
 
         else:  # codex
             fd, last_msg_path = tempfile.mkstemp(suffix=".txt")
@@ -692,24 +982,33 @@ def _run_subprocess_row(
                 command.extend(["--model", model])
             completed = subprocess.run(
                 command, input=prompt, text=True,
-                capture_output=True, timeout=timeout
+                capture_output=True, timeout=timeout, cwd=workdir, env=env
             )
+            out.update(stdout=completed.stdout, stderr=completed.stderr,
+                       returncode=completed.returncode, text=completed.stdout)
             if os.path.exists(last_msg_path):
                 with open(last_msg_path) as f:
-                    output = f.read()
+                    last = f.read()
                 os.remove(last_msg_path)
-            else:
-                output = completed.stdout
+                if last.strip():
+                    out["text"] = last
 
-        parsed = _extract_json(output)
-        if parsed is None:
-            return None, output, f"Could not parse JSON from output: {output[:300]}"
-        return parsed, output, None
+        if out["error"] is None and out["returncode"] not in (None, 0):
+            out["error"] = f"Exited with code {out['returncode']}: {(out['stderr'] or out['stdout'])[:300]}"
 
     except subprocess.TimeoutExpired:
-        return None, "", f"Subprocess timed out after {timeout}s"
+        out["error"] = f"Subprocess timed out after {timeout}s"
     except Exception as e:
-        return None, "", str(e)
+        out["error"] = str(e)
+
+    # A failed call, or a reply with no JSON object in it, may be the plan's usage
+    # limit. Only the reply, the error and stderr are searched: Claude Code's JSON
+    # output always carries a rate-limit status line, even when nothing is wrong.
+    if out["error"] is not None or not isinstance(_extract_json(out["text"]), dict):
+        said = " ".join([out["error"] or "", out["stderr"] or "", out["text"] or ""])
+        if _ANNOT_LIMIT_RE.search(said):
+            out["limit"] = True
+    return out
 
 
 def _annotation_job_worker(
@@ -717,56 +1016,170 @@ def _annotation_job_worker(
     unannotated_indices: List[int], schema: Dict[str, Any],
     work_path: str, tool: str, tool_path: str,
     model: Optional[str], timeout: int, reasoning_effort: str = "high",
-    ollama_base_url: str = "http://localhost:11434"
+    ollama_base_url: str = "http://localhost:11434",
+    batch_size: int = 1, no_api_key: bool = False, raw_path: Optional[str] = None,
+    instructions: Optional[str] = None, keep_claude_code_prompt: bool = False
 ) -> None:
-    """Background thread: annotate each row with a fresh subprocess."""
+    """Background thread: annotate the rows, each batch (one row by default) in a
+    fresh process that sees only that batch. A bad reply is asked again, up to
+    _ANNOT_TRIES times. Every reply is kept word for word in raw_path, after a
+    first line recording the job and its instructions. Hitting the
+    plan's usage limit stops the job with every saved row kept, so running the
+    job again later picks up where it stopped."""
     import csv as csv_module
 
     annot_fields = list(schema.keys())
     job = _annot_jobs[job_id]
     job["status"] = "running"
+    batch_size = max(1, int(batch_size or 1))
 
-    for row_idx in unannotated_indices:
-        if job.get("cancelled"):
-            job["status"] = "cancelled"
-            return
+    # Claude and Codex start in an empty folder, so no project files
+    # (CLAUDE.md, AGENTS.md, settings) reach the call.
+    workdir = tempfile.mkdtemp(prefix="clauder_annot_") if tool in ("claude", "codex") else None
+    env = None
+    if no_api_key and tool in _ANNOT_API_KEYS:
+        env = {k: v for k, v in os.environ.items() if not k.startswith(_ANNOT_API_KEYS[tool])}
 
-        row = rows[row_idx]
-        prompt = _build_subprocess_prompt(row, schema, annot_fields)
-        result, raw, err = _run_subprocess_row(prompt, tool, tool_path, model, timeout, reasoning_effort, ollama_base_url)
+    # Claude Code's own system prompt, the built-in instructions that make the
+    # model a command-line coding assistant, is left out of each Claude call
+    # unless asked for: a labeller has no tools or files for it to describe,
+    # and it can colour the answers. A Claude Code without --system-prompt
+    # keeps it, and the raw file's first line says which happened.
+    prompt_label = _claude_code_prompt_label(tool, tool_path, keep_claude_code_prompt)
+    replace_system = prompt_label == "removed"
+    system_flag = "--system-prompt" if replace_system else "--append-system-prompt"
 
-        if err or result is None:
-            job["errors"].append({
-                "row_id": row.get("row_id", row_idx),
-                "error": err or "No result"
-            })
-            job["done"] += 1
-            continue
+    # The task's instructions go to every call once, ahead of the rows. Claude
+    # gets them as the system prompt (added to Claude Code's own when that is
+    # kept), which stays the same from call to call and so can be reused
+    # between calls; every other backend reads them at the top of the prompt.
+    # Very long instructions on Windows go in the prompt too, since a command
+    # line there is capped near 8,000 characters.
+    instructions = (instructions or "").strip() or None
+    use_system = bool(
+        instructions and tool == "claude"
+        and _claude_has_flag(tool_path, system_flag)
+        and (os.name != "nt" or len(instructions) <= 7000)
+    )
+    system_text = instructions if use_system else None
+    prompt_instructions = None if use_system else instructions
 
-        valid, validation_err = _validate_annotation(
-            {k: str(v) for k, v in result.items()}, schema
-        )
-        if not valid:
-            job["errors"].append({
-                "row_id": row.get("row_id", row_idx),
-                "error": f"Validation failed: {validation_err}"
-            })
-            job["done"] += 1
-            continue
+    def row_label(i: int):
+        return rows[i].get("row_id", i)
 
-        for field in annot_fields:
-            if field in result:
-                rows[row_idx][field] = result[field]
-
-        # Save immediately after each row
-        with open(work_path, "w", newline="", encoding="utf-8") as f:
+    def save() -> None:
+        # Written to a side file and moved into place, so a failed write can
+        # never leave the working file half written.
+        tmp_path = work_path + ".saving"
+        with open(tmp_path, "w", newline="", encoding="utf-8") as f:
             writer = csv_module.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
+        os.replace(tmp_path, work_path)
 
-        job["done"] += 1
+    def keep_raw(pending: List[int], attempt: int, res: Dict[str, Any]) -> None:
+        if not raw_path:
+            return
+        entry = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "rows": [row_label(i) for i in pending],
+            "try": attempt, "tool": tool, "model": model,
+            "returncode": res["returncode"], "error": res["error"],
+            "stdout": res["stdout"], "stderr": res["stderr"],
+        }
+        try:
+            with open(raw_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
-    job["status"] = "complete"
+    if raw_path:
+        try:
+            with open(raw_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "type": "job", "time": datetime.now().isoformat(timespec="seconds"),
+                    "job_id": job_id, "tool": tool, "model": model, "batch_size": batch_size,
+                    "instructions": instructions,
+                    "instructions_sent_as": ("system prompt" if use_system else "prompt") if instructions else None,
+                    "claude_code_prompt": prompt_label,
+                }, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    try:
+        for start in range(0, len(unannotated_indices), batch_size):
+            pending = list(unannotated_indices[start:start + batch_size])
+            last_err: Dict[int, str] = {}
+            for attempt in range(1, _ANNOT_TRIES + 1):
+                if job.get("cancelled"):
+                    job["status"] = "cancelled"
+                    return
+                if batch_size == 1:
+                    prompt = _build_subprocess_prompt(rows[pending[0]], schema, annot_fields,
+                                                      prompt_instructions)
+                else:
+                    prompt = _build_batch_prompt([(str(i), rows[i]) for i in pending], schema,
+                                                 annot_fields, prompt_instructions)
+                res = _annotation_call(prompt, tool, tool_path, model, timeout,
+                                       reasoning_effort, ollama_base_url, workdir, env,
+                                       system_text=system_text, replace_system=replace_system)
+                keep_raw(pending, attempt, res)
+
+                if res["limit"]:
+                    job["status"] = "stopped_at_limit"
+                    job["limit_message"] = (res["error"] or res["stderr"] or res["stdout"] or "")[:300]
+                    return
+
+                parsed = None if res["error"] else _extract_json(res["text"])
+                if not isinstance(parsed, dict):
+                    parsed = None
+                if parsed is None:
+                    err = res["error"] or f"Could not parse JSON from output: {res['text'][:300]}"
+                    last_err = {i: err for i in pending}
+                    continue
+
+                if batch_size == 1:
+                    results = {pending[0]: parsed}
+                else:
+                    results = {i: parsed.get(str(i)) for i in pending}
+
+                still: List[int] = []
+                for i in pending:
+                    result = results.get(i)
+                    if not isinstance(result, dict):
+                        last_err[i] = "No annotation returned for this row"
+                        still.append(i)
+                        continue
+                    valid, validation_err = _validate_annotation(
+                        {k: str(v) for k, v in result.items()}, schema
+                    )
+                    if not valid:
+                        last_err[i] = f"Validation failed: {validation_err}"
+                        still.append(i)
+                        continue
+                    for field in annot_fields:
+                        rows[i][field] = result[field]
+                    job["done"] += 1
+
+                # Save immediately after each answered call
+                if len(still) < len(pending):
+                    save()
+                pending = still
+                if not pending:
+                    break
+
+            for i in pending:
+                job["errors"].append({"row_id": row_label(i), "error": last_err.get(i, "No result")})
+                job["done"] += 1
+
+        job["status"] = "complete"
+    except Exception as e:
+        # Without this a crash left the job reading "running" forever.
+        job["status"] = "failed"
+        job["errors"].append({"row_id": "-", "error": f"The job stopped: {type(e).__name__}: {e}"})
+    finally:
+        if workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 # --- Annotation helpers ---
@@ -853,10 +1266,83 @@ def _save_annotation_csv() -> None:
         writer.writerows(_annot_state["rows"])
 
 
-# Define available tools
-@server.list_tools()
-async def list_tools() -> List[types.Tool]:
-    """List available R tools."""
+# Which group each tool belongs to. The addin writes the enabled groups into
+# the session's discovery file. Anything not listed counts as core, so a newly
+# added tool is never hidden by accident.
+TOOL_GROUPS: Dict[str, str] = {}
+for _n in ("get_active_document", "modify_code_section", "insert_text", "suggest_edit"):
+    TOOL_GROUPS[_n] = "editor"
+for _n in ("checkpoint_session", "restore_session", "list_checkpoints",
+           "get_session_history", "generate_notebook", "clean_error_log"):
+    TOOL_GROUPS[_n] = "session"
+for _n in ("send_message", "check_messages", "wait_for_message", "wake_on_message", "coordination_roster",
+           "set_agent_name", "create_task_list", "update_task_status"):
+    TOOL_GROUPS[_n] = "coord"
+for _n in ("execute_r_async", "get_async_result", "cancel_async_job"):
+    TOOL_GROUPS[_n] = "async"
+for _n in ("reconcile_values", "verify_references", "check_cross_references",
+           "probe_scripts", "screening_report", "get_bibtex", "search_citations",
+           "annotate", "run_annotation_job", "get_annotation_job_status",
+           "cancel_annotation_job", "load_annotation_data", "generate_codebook"):
+    TOOL_GROUPS[_n] = "audit"
+
+
+# Tools whose handlers post R code to the session. Against a Python session
+# the interpreter receives R and raises a syntax error that explains nothing,
+# so they are refused with a reason instead. Derived by checking which
+# handlers call execute_r_code_via_addin or post_to_r_addin; execute_r and
+# execute_r_with_plot are excluded because they run whatever language the
+# session speaks.
+R_ONLY_TOOLS = frozenset({
+    "cancel_async_job", "check_cross_references", "checkpoint_session",
+    "clean_error_log", "create_task_list", "execute_r_async",
+    "generate_codebook", "generate_notebook", "get_active_document",
+    "get_async_result", "get_bibtex", "get_r_info", "get_session_history",
+    "get_viewer_content", "insert_text", "list_checkpoints",
+    "modify_code_section", "probe_scripts", "read_file", "reconcile_values",
+    "restore_session", "screening_report", "search_citations",
+    "search_project_code", "suggest_edit", "update_task_status",
+    "verify_references",
+})
+
+
+def _session_language() -> str:
+    """Language of the session we are bound to. Records written before Python
+    sessions existed carry no `language`, and those are all R."""
+    info = _session_info()
+    if not info:
+        return "r"
+    return str(info.get("language") or "r").lower()
+
+
+def _enabled_tool_sets() -> Optional[List[str]]:
+    """Groups this session exposes, or None meaning all of them."""
+    info = _session_info()
+    if not info:
+        return None
+    sets = info.get("tool_sets")
+    if not sets or sets == "all" or sets == ["all"]:
+        return None
+    return list(sets) if isinstance(sets, list) else [sets]
+
+
+def _filter_tools(tools: List[types.Tool]) -> List[types.Tool]:
+    """Drop tools whose group the session switched off.
+
+    connect_session and list_sessions always survive: without them an agent
+    cannot reach the session that holds the setting.
+    """
+    enabled = _enabled_tool_sets()
+    if enabled is None:
+        return tools
+    always = {"connect_session", "list_sessions"}
+    keep = [t for t in tools
+            if t.name in always or TOOL_GROUPS.get(t.name, "core") in enabled]
+    return keep or tools
+
+
+def _all_tools() -> List[types.Tool]:
+    """Every tool this server implements, before per-session filtering."""
     return [
         types.Tool(
             name="execute_r",
@@ -1182,13 +1668,22 @@ async def list_tools() -> List[types.Tool]:
         ),
         types.Tool(
             name="get_async_result",
-            description="Check the result of an async R job. Waits ~10 seconds before checking to avoid excessive polling. If the job is still running, call this again.",
+            description=(
+                "Wait for an async R job and return its result. Returns the moment the job "
+                "finishes, or after wait_s seconds if it is still running (then call again to "
+                "keep waiting). One call replaces many polls, and the main R session stays "
+                "free while you wait. Pass wait_s=0 for a quick status check."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "job_id": {
                         "type": "string",
                         "description": "The job ID returned by execute_r_async"
+                    },
+                    "wait_s": {
+                        "type": "number",
+                        "description": "Max seconds to wait for the job to finish (default 300, cap 1800). Lower it if your client times out tool calls sooner."
                     }
                 },
                 "required": ["job_id"]
@@ -1439,7 +1934,12 @@ async def list_tools() -> List[types.Tool]:
             name="run_annotation_job",
             description=(
                 "Annotate a CSV dataset using a fresh subprocess (or Ollama HTTP call) per row, with no context bleed between rows. "
-                "Each row is scored by a brand-new claude, codex, gemini, agy (Antigravity), qwen, or ollama process that sees only that row. "
+                "Each row is scored by a brand-new claude, codex, agy (Antigravity), qwen, or ollama process that sees only that row. "
+                "Claude calls run with no tools, MCP servers, hooks, CLAUDE.md, slash commands or Claude Code's own system prompt, from an empty folder; "
+                "Codex calls run with no MCP servers, from an empty folder. "
+                "A reply that is not valid JSON or fails the schema is asked again, up to 3 tries. "
+                "Every reply is kept word for word in {name}_annotating_raw.jsonl. "
+                "If the plan's usage limit is hit the job stops with every saved row kept; run it again later to continue. "
                 "Runs in the background; returns a job ID immediately. "
                 "Use get_annotation_job_status to check progress and cancel_annotation_job to stop. "
                 "The original CSV is never modified; results go to {name}_annotating.csv. "
@@ -1454,7 +1954,7 @@ async def list_tools() -> List[types.Tool]:
                     },
                     "tool": {
                         "type": "string",
-                        "description": "Backend to use: 'claude' (default), 'codex', 'gemini', 'agy' (Antigravity CLI, Google's replacement for Gemini CLI starting 2026-06-18), 'qwen' (Qwen Code CLI), or 'ollama' (local Ollama HTTP server). The CLI tools require their respective binary on PATH; ollama requires `ollama serve` running locally."
+                        "description": "Backend to use: 'claude' (default), 'codex', 'agy' (Antigravity CLI, Google's replacement for Gemini CLI, which shut down on 2026-06-18), 'qwen' (Qwen Code CLI), or 'ollama' (local Ollama HTTP server). The CLI tools require their respective binary on PATH; ollama requires `ollama serve` running locally."
                     },
                     "model": {
                         "type": "string",
@@ -1471,6 +1971,22 @@ async def list_tools() -> List[types.Tool]:
                     "ollama_base_url": {
                         "type": "string",
                         "description": "Ollama only: base URL of the Ollama server. Defaults to 'http://localhost:11434'. Set this to point at a remote Ollama instance (e.g. a LAN GPU box)."
+                    },
+                    "batch_size": {
+                        "type": "integer",
+                        "description": "Rows per call (default 1, max 200). Keep 1 unless the job is very large: with 1, no row can influence another. Above 1, each call sees that many rows at once, which is much faster and cheaper but lets rows in the same call affect each other."
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "Task instructions or codebook, given once per call ahead of the rows, instead of copying them into a column on every row. Claude gets them as a system prompt, which can be reused from call to call. Recorded at the top of the raw replies file."
+                    },
+                    "no_api_key": {
+                        "type": "boolean",
+                        "description": "Remove API keys from each call's environment (every ANTHROPIC_* variable for claude, so no key, token or custom base URL reaches the call; OPENAI_API_KEY and CODEX_API_KEY for codex) so the CLI uses your subscription login and an API key is never billed. Default false. Leave it off if an API key is how you sign in."
+                    },
+                    "keep_claude_code_prompt": {
+                        "type": "boolean",
+                        "description": "Claude only. Keep Claude Code's own system prompt (the long built-in instructions that make the model a command-line coding assistant) in each call. Default false: the call runs with no system prompt beyond your instructions, since a labeller has no tools or files for that prompt to describe and it can colour the answers. Set true only to match runs made before clauder-mcp 0.16.5. A Claude Code without the --system-prompt option keeps it either way; the raw replies file records which happened."
                     }
                 },
                 "required": ["csv_path"]
@@ -1741,6 +2257,31 @@ async def list_tools() -> List[types.Tool]:
             }
         ),
         types.Tool(
+            name="wake_on_message",
+            description=(
+                "Get a command that wakes you when a coordination message for you arrives, "
+                "so you never set timers or keep checking while you wait. Run the command "
+                "it returns as a background command (Claude Code: the Bash tool with "
+                "run_in_background; Antigravity: run it and let it carry on in the "
+                "background). It finishes the moment a message for you lands on the board, "
+                "and your app wakes you when it finishes. Then read with check_messages and "
+                "run the command again to keep listening."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "timeout_s": {"type": "number", "description": "Stop waiting after this many seconds. Default 0: wait until a message comes or your app closes."},
+                    "as_agent": {"type": "string", "description": "Listen as this identity. For personas sharing one MCP connection."}
+                }
+            },
+            annotations={
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            }
+        ),
+        types.Tool(
             name="check_messages",
             description=(
                 "Read unread coordination events addressed to you (or to all), then advance "
@@ -1769,7 +2310,8 @@ async def list_tools() -> List[types.Tool]:
                 "writes, which removes coordination latency, crossed messages, and the need "
                 "for a human to schedule polls. Does not touch the R session, so the other "
                 "agent can keep executing code while you wait. Filter by sender and/or type "
-                "for rendezvous ('wait until beta sends signal HANDOFF_READY')."
+                "for rendezvous ('wait until beta sends signal HANDOFF_READY'). To be woken "
+                "while you are idle, without holding a tool call open, use wake_on_message."
             ),
             inputSchema={
                 "type": "object",
@@ -1797,7 +2339,8 @@ async def list_tools() -> List[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "stale_after_s": {"type": "number", "description": "Seconds after which an agent is flagged stale (default 900)."}
+                    "stale_after_s": {"type": "number", "description": "Seconds after which an agent is flagged stale (default 900)."},
+                    "hide_after_s": {"type": "number", "description": "Omit agents not seen for this long (default 86400, one day). The log keeps them; this only controls what is listed. Raise it to see the full history."}
                 }
             },
             annotations={
@@ -2003,18 +2546,48 @@ async def list_tools() -> List[types.Tool]:
         ),
     ]
 
+
+# Define available tools
+@server.list_tools()
+async def list_tools() -> List[types.Tool]:
+    """List available R tools, minus any group this session switched off."""
+    return _filter_tools(_all_tools())
+
 @server.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextContent | types.ImageContent]:
     """Handle R tool calls."""
-    global _target_session, _target_identity, _agent_introduced, _agent_id
+    global _target_session, _target_identity, _agent_introduced, _agent_id, _rebind_note
 
     # These tools check Python-side state only — skip addin check
     _skip_addin_check = {"list_sessions", "connect_session", "load_annotation_data", "annotate", "run_annotation_job", "get_annotation_job_status", "cancel_annotation_job",
                          # File-based coordination must work while R is busy or down
-                         "send_message", "check_messages", "wait_for_message", "coordination_roster",
+                         "send_message", "check_messages", "wait_for_message", "wake_on_message",
+                         "coordination_roster",
                          # Identity is Python-side state, settable while R is down
                          "set_agent_name"}
+    # Refuse an R-only tool against a Python session with a reason. Without
+    # this the R code reaches the Python interpreter and comes back as
+    # "invalid syntax (1134164898.py, line 1)", which tells nobody anything.
+    if name in R_ONLY_TOOLS and _session_language() == "python":
+        return [types.TextContent(
+            type="text",
+            text=(f"'{name}' runs R code, and this session is Python. "
+                  "execute_r and execute_r_with_plot work here (they run "
+                  "Python), as do the coordination tools. The editor, "
+                  "checkpoint and manuscript-audit tools need an R session: "
+                  "use list_sessions to find one, or read and write files "
+                  "with your own file tools instead.")
+        )]
+
     if name not in _skip_addin_check:
+        # Resolve the binding first and report ITS failure by name. Letting
+        # check_addin_status swallow a SessionBindingError produced "the addin
+        # is not running" while the addin was plainly running, and told the
+        # agent nothing about connect_session.
+        try:
+            get_r_addin_url()
+        except SessionBindingError as exc:
+            return [types.TextContent(type="text", text=f"Session binding: {exc}")]
         # Check if the R addin is running
         if not await check_addin_status():
             return [types.TextContent(
@@ -2023,6 +2596,11 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
             )]
 
     result_contents = []
+
+    # A bound session was restarted underneath us: say so once, up front.
+    if _rebind_note:
+        result_contents.append(types.TextContent(type="text", text=_rebind_note))
+        _rebind_note = None
 
     # First tool call: prepend agent context so the model knows its identity
     if not _agent_introduced:
@@ -2043,7 +2621,8 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         result = await execute_r_code_via_addin(arguments["code"])
 
         if not result.get("success", False):
-            err_text = f"R Error: {result.get('error', 'Unknown error')}"
+            lang_label = "Python" if _session_language() == "python" else "R"
+            err_text = f"{lang_label} Error: {result.get('error', 'Unknown error')}"
             # Include whatever printed before the error — often the context
             # the agent needs to fix the code
             if result.get("output"):
@@ -2085,15 +2664,18 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
                 text="Error: 'code' parameter is required"
             )]
 
-        # First, perform the one-time check for ggplot2.
-        if not await check_ggplot_installed():
+        # ggplot2 is an R precondition, so it must not gate a Python session,
+        # where plots come from matplotlib.
+        if _session_language() != "python" and not await check_ggplot_installed():
             return [types.TextContent(
                 type="text",
                 text="Error: The 'ggplot2' package is required for this tool but is not installed. Please install it in RStudio."
             )]
 
         # The package is available, so just execute the user's code directly.
-        result = await execute_r_code_via_addin(arguments["code"])
+        # want_plot=True: this tool exists to return the image, so it overrides
+        # the session's plot_auto setting.
+        result = await execute_r_code_via_addin(arguments["code"], want_plot=True)
         
         # Add text output
         if "output" in result and result["output"]:
@@ -2106,7 +2688,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         if not result.get("success", False):
             result_contents.append(types.TextContent(
                 type="text",
-                text=f"R Error: {result.get('error', 'Unknown error')}"
+                text=f"{'Python' if _session_language() == 'python' else 'R'} Error: {result.get('error', 'Unknown error')}"
             ))
         
         # Add plot if available
@@ -2169,8 +2751,33 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         result = await execute_r_code_via_addin(f"""
         if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {{
             want <- "{target}"
+            # Positron's rstudioapi shim returns a usable context whose id is
+            # NULL, where RStudio fills one in. Requiring an id rejected a
+            # perfectly good editor context, so judge usability by whether we
+            # can actually read the document.
+            ctx_usable <- function(c) {{
+              !is.null(c) && (
+                (!is.null(c$id) && nzchar(c$id)) ||
+                (!is.null(c$path) && nzchar(c$path)) ||
+                length(c$contents) > 0
+              )
+            }}
             ctx <- tryCatch(rstudioapi::getSourceEditorContext(), error = function(e) NULL)
-            if (is.null(ctx) || is.null(ctx$id) || !nzchar(ctx$id)) {{
+            # A supplied path has to be able to open the file when nothing is
+            # focused at all. The checks below used to run first, so `path`
+            # could never rescue an empty editor.
+            if (nzchar(want) && !ctx_usable(ctx)) {{
+                tryCatch({{
+                  if (isTRUE(rstudioapi::hasFun("documentOpen"))) {{
+                    rstudioapi::documentOpen(want)
+                  }} else {{
+                    rstudioapi::navigateToFile(want)
+                  }}
+                  Sys.sleep(0.4)
+                  ctx <- rstudioapi::getSourceEditorContext()
+                }}, error = function(e) NULL)
+            }}
+            if (!ctx_usable(ctx)) {{
                 list(error = paste("No source document is open or focused in RStudio.",
                                    "Open the target file in the Source pane first, then retry."))
             }} else {{
@@ -2179,9 +2786,17 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
                     a <- normalizePath(want, mustWork = FALSE)
                     b <- if (nzchar(p)) normalizePath(p, mustWork = FALSE) else ""
                     if (!identical(a, b)) {{
-                        tryCatch({{ rstudioapi::documentOpen(want); Sys.sleep(0.3)
-                                   ctx <- rstudioapi::getSourceEditorContext()
-                                   p <- ctx$path; if (is.null(p)) p <- "" }},
+                        tryCatch({{
+                          # Positron shims navigateToFile but not documentOpen,
+                          # so prefer whichever the IDE actually implements.
+                          if (isTRUE(rstudioapi::hasFun("documentOpen"))) {{
+                            rstudioapi::documentOpen(want)
+                          }} else {{
+                            rstudioapi::navigateToFile(want)
+                          }}
+                          Sys.sleep(0.3)
+                          ctx <- rstudioapi::getSourceEditorContext()
+                          p <- ctx$path; if (is.null(p)) p <- "" }},
                                  error = function(e) NULL)
                     }}
                 }}
@@ -2229,8 +2844,33 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         suggest_code = f"""
         if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {{
             want <- "{target}"
+            # Positron's rstudioapi shim returns a usable context whose id is
+            # NULL, where RStudio fills one in. Requiring an id rejected a
+            # perfectly good editor context, so judge usability by whether we
+            # can actually read the document.
+            ctx_usable <- function(c) {{
+              !is.null(c) && (
+                (!is.null(c$id) && nzchar(c$id)) ||
+                (!is.null(c$path) && nzchar(c$path)) ||
+                length(c$contents) > 0
+              )
+            }}
             ctx <- tryCatch(rstudioapi::getSourceEditorContext(), error = function(e) NULL)
-            if (is.null(ctx) || is.null(ctx$id) || !nzchar(ctx$id)) {{
+            # A supplied path has to be able to open the file when nothing is
+            # focused at all. The checks below used to run first, so `path`
+            # could never rescue an empty editor.
+            if (nzchar(want) && !ctx_usable(ctx)) {{
+                tryCatch({{
+                  if (isTRUE(rstudioapi::hasFun("documentOpen"))) {{
+                    rstudioapi::documentOpen(want)
+                  }} else {{
+                    rstudioapi::navigateToFile(want)
+                  }}
+                  Sys.sleep(0.4)
+                  ctx <- rstudioapi::getSourceEditorContext()
+                }}, error = function(e) NULL)
+            }}
+            if (!ctx_usable(ctx)) {{
                 list(success = FALSE,
                      error = "No source document is open or focused in RStudio. Open the target file first.")
             }} else {{
@@ -2239,9 +2879,17 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
                     a <- normalizePath(want, mustWork = FALSE)
                     b <- if (nzchar(p)) normalizePath(p, mustWork = FALSE) else ""
                     if (!identical(a, b)) {{
-                        tryCatch({{ rstudioapi::documentOpen(want); Sys.sleep(0.3)
-                                   ctx <- rstudioapi::getSourceEditorContext()
-                                   p <- ctx$path; if (is.null(p)) p <- "" }},
+                        tryCatch({{
+                          # Positron shims navigateToFile but not documentOpen,
+                          # so prefer whichever the IDE actually implements.
+                          if (isTRUE(rstudioapi::hasFun("documentOpen"))) {{
+                            rstudioapi::documentOpen(want)
+                          }} else {{
+                            rstudioapi::navigateToFile(want)
+                          }}
+                          Sys.sleep(0.3)
+                          ctx <- rstudioapi::getSourceEditorContext()
+                          p <- ctx$path; if (is.null(p)) p <- "" }},
                                  error = function(e) NULL)
                     }}
                 }}
@@ -2426,7 +3074,9 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         escaped_pattern = escape_r_string(pattern)
         escaped_root = escape_r_string(root_dir)
         escaped_extensions = escape_r_string(extensions)
-        code = f'ClaudeR:::search_project_code_impl("{escaped_pattern}", extensions = "{escaped_extensions}", root_dir = "{escaped_root}", max_results = {max_results}L, ignore_case = {"TRUE" if ignore_case else "FALSE"})'
+        max_files = int(arguments.get("max_files", 2000))
+        allow_wide = "TRUE" if arguments.get("allow_wide") else "FALSE"
+        code = f'ClaudeR:::search_project_code_impl("{escaped_pattern}", extensions = "{escaped_extensions}", root_dir = "{escaped_root}", max_results = {max_results}L, ignore_case = {"TRUE" if ignore_case else "FALSE"}, max_files = {max_files}L, allow_wide = {allow_wide})'
         result = await execute_r_code_via_addin(code)
         if result.get("success", False):
             output = result.get("output", "No results.")
@@ -2541,15 +3191,28 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
 
     elif name == "get_async_result":
         job_id = arguments.get("job_id", "")
+        try:
+            wait_s = min(max(float(arguments.get("wait_s", 300)), 0.0), 1800.0)
+        except (TypeError, ValueError):
+            wait_s = 300.0
 
-        # Throttle polling — wait before checking
-        await asyncio.sleep(10)
-
-        # Ask R for the job status. Collection loads outputs back into the
-        # main session (readRDS + assign), which can be slow for big results.
-        result = await post_to_r_addin({"check_job": job_id}, timeout=120.0)
-
-        status = result.get("status", "unknown")
+        # Wait here instead of making the agent poll: a 20-minute fit used to
+        # cost ~120 calls at the old fixed 10 s delay. The checks back off
+        # from 2 s to 10 s, so short jobs return quickly and long ones cost
+        # the main session one cheap is_alive() call every 10 s. Collection
+        # loads outputs back into the main session (readRDS + assign), which
+        # can be slow for big results, hence the long per-check timeout.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_s
+        pause = 2.0
+        while True:
+            result = await post_to_r_addin({"check_job": job_id}, timeout=120.0)
+            status = result.get("status", "unknown")
+            remaining = deadline - loop.time()
+            if status != "running" or remaining <= 0:
+                break
+            await asyncio.sleep(min(pause, remaining))
+            pause = min(pause * 1.5, 10.0)
 
         if status == "not_found":
             return [types.TextContent(
@@ -2662,18 +3325,22 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         if not sessions:
             return [types.TextContent(
                 type="text",
-                text="No active R sessions found. Start the ClaudeR addin in RStudio first."
+                text="No active sessions found. Start the ClaudeR addin in RStudio, "
+                     "or run `import clauder; clauder.start()` in a Python session."
             )]
 
         lines = []
         for s in sessions:
             target_marker = " (connected)" if _target_session == s.get("session_name") else ""
+            # "language" is absent in records written before Python sessions
+            # existed, and those are all R.
+            lang = s.get("language") or "r"
             lines.append(
-                f"  {s.get('session_name', '?')} — port {s.get('port', '?')}, "
+                f"  {s.get('session_name', '?')} [{lang}] — port {s.get('port', '?')}, "
                 f"pid {s.get('pid', '?')}, started {s.get('started_at', '?')}{target_marker}"
             )
 
-        header = f"Active R sessions ({len(sessions)}):"
+        header = f"Active sessions ({len(sessions)}):"
         current = f"Current agent: {_agent_id}"
         target = f"Connected to: {_target_session or 'auto (first available)'}"
         return [types.TextContent(
@@ -2703,7 +3370,22 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         _target_session = session_name
         _target_identity = _session_identity(matches[0])
 
-        connect_msg = f"Connected to session '{session_name}'. All subsequent tool calls will be routed there."
+        # Say which language this session runs. An agent that assumes R and
+        # sends R code to a Python session gets a syntax error it cannot
+        # explain, so this is stated at the moment it matters.
+        lang = (matches[0].get("language") or "r").lower()
+        if lang == "python":
+            connect_msg = (
+                f"Connected to session '{session_name}'. This is a PYTHON session: "
+                "send Python code to execute_r and execute_r_with_plot, not R. "
+                "The namespace persists between calls. All subsequent tool calls "
+                "are routed here."
+            )
+        else:
+            connect_msg = (
+                f"Connected to session '{session_name}'. This is an R session. "
+                "All subsequent tool calls will be routed there."
+            )
         contents = [types.TextContent(type="text", text=connect_msg)]
 
         # Deliver agent introduction right after connecting
@@ -2848,8 +3530,33 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {{
             want <- "{target}"
             do_save <- {do_save}
+            # Positron's rstudioapi shim returns a usable context whose id is
+            # NULL, where RStudio fills one in. Requiring an id rejected a
+            # perfectly good editor context, so judge usability by whether we
+            # can actually read the document.
+            ctx_usable <- function(c) {{
+              !is.null(c) && (
+                (!is.null(c$id) && nzchar(c$id)) ||
+                (!is.null(c$path) && nzchar(c$path)) ||
+                length(c$contents) > 0
+              )
+            }}
             ctx <- tryCatch(rstudioapi::getSourceEditorContext(), error = function(e) NULL)
-            if (is.null(ctx) || is.null(ctx$id) || !nzchar(ctx$id)) {{
+            # A supplied path has to be able to open the file when nothing is
+            # focused at all. The checks below used to run first, so `path`
+            # could never rescue an empty editor.
+            if (nzchar(want) && !ctx_usable(ctx)) {{
+                tryCatch({{
+                  if (isTRUE(rstudioapi::hasFun("documentOpen"))) {{
+                    rstudioapi::documentOpen(want)
+                  }} else {{
+                    rstudioapi::navigateToFile(want)
+                  }}
+                  Sys.sleep(0.4)
+                  ctx <- rstudioapi::getSourceEditorContext()
+                }}, error = function(e) NULL)
+            }}
+            if (!ctx_usable(ctx)) {{
                 list(success = FALSE,
                      error = paste("No source document is open or focused in RStudio.",
                                    "Open the target file in the Source pane (or pass 'path'), then retry."))
@@ -2859,9 +3566,17 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
                     a <- normalizePath(want, mustWork = FALSE)
                     b <- if (nzchar(p)) normalizePath(p, mustWork = FALSE) else ""
                     if (!identical(a, b)) {{
-                        tryCatch({{ rstudioapi::documentOpen(want); Sys.sleep(0.3)
-                                   ctx <- rstudioapi::getSourceEditorContext()
-                                   p <- ctx$path; if (is.null(p)) p <- "" }},
+                        tryCatch({{
+                          # Positron shims navigateToFile but not documentOpen,
+                          # so prefer whichever the IDE actually implements.
+                          if (isTRUE(rstudioapi::hasFun("documentOpen"))) {{
+                            rstudioapi::documentOpen(want)
+                          }} else {{
+                            rstudioapi::navigateToFile(want)
+                          }}
+                          Sys.sleep(0.3)
+                          ctx <- rstudioapi::getSourceEditorContext()
+                          p <- ctx$path; if (is.null(p)) p <- "" }},
                                  error = function(e) NULL)
                     }}
                 }}
@@ -2963,8 +3678,33 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {{
             want <- "{target}"
             do_save <- {do_save}
+            # Positron's rstudioapi shim returns a usable context whose id is
+            # NULL, where RStudio fills one in. Requiring an id rejected a
+            # perfectly good editor context, so judge usability by whether we
+            # can actually read the document.
+            ctx_usable <- function(c) {{
+              !is.null(c) && (
+                (!is.null(c$id) && nzchar(c$id)) ||
+                (!is.null(c$path) && nzchar(c$path)) ||
+                length(c$contents) > 0
+              )
+            }}
             ctx <- tryCatch(rstudioapi::getSourceEditorContext(), error = function(e) NULL)
-            if (is.null(ctx) || is.null(ctx$id) || !nzchar(ctx$id)) {{
+            # A supplied path has to be able to open the file when nothing is
+            # focused at all. The checks below used to run first, so `path`
+            # could never rescue an empty editor.
+            if (nzchar(want) && !ctx_usable(ctx)) {{
+                tryCatch({{
+                  if (isTRUE(rstudioapi::hasFun("documentOpen"))) {{
+                    rstudioapi::documentOpen(want)
+                  }} else {{
+                    rstudioapi::navigateToFile(want)
+                  }}
+                  Sys.sleep(0.4)
+                  ctx <- rstudioapi::getSourceEditorContext()
+                }}, error = function(e) NULL)
+            }}
+            if (!ctx_usable(ctx)) {{
                 list(success = FALSE,
                      error = paste("No source document is open or focused in RStudio.",
                                    "Open the target file in the Source pane (or pass 'path'), then retry."))
@@ -2974,9 +3714,17 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
                     a <- normalizePath(want, mustWork = FALSE)
                     b <- if (nzchar(p)) normalizePath(p, mustWork = FALSE) else ""
                     if (!identical(a, b)) {{
-                        tryCatch({{ rstudioapi::documentOpen(want); Sys.sleep(0.3)
-                                   ctx <- rstudioapi::getSourceEditorContext()
-                                   p <- ctx$path; if (is.null(p)) p <- "" }},
+                        tryCatch({{
+                          # Positron shims navigateToFile but not documentOpen,
+                          # so prefer whichever the IDE actually implements.
+                          if (isTRUE(rstudioapi::hasFun("documentOpen"))) {{
+                            rstudioapi::documentOpen(want)
+                          }} else {{
+                            rstudioapi::navigateToFile(want)
+                          }}
+                          Sys.sleep(0.3)
+                          ctx <- rstudioapi::getSourceEditorContext()
+                          p <- ctx$path; if (is.null(p)) p <- "" }},
                                  error = function(e) NULL)
                     }}
                 }}
@@ -3047,13 +3795,24 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         timeout = int(arguments.get("timeout", 60))
         reasoning_effort = arguments.get("reasoning_effort", "high")
         ollama_base_url = (arguments.get("ollama_base_url") or "http://localhost:11434").rstrip("/")
+        no_api_key = bool(arguments.get("no_api_key", False))
+        keep_claude_code_prompt = bool(arguments.get("keep_claude_code_prompt", False))
+        instructions = str(arguments.get("instructions") or "").strip() or None
+        try:
+            batch_size = int(arguments.get("batch_size") or 1)
+        except (TypeError, ValueError):
+            return [types.TextContent(type="text", text="Error: 'batch_size' must be a whole number.")]
+        if not 1 <= batch_size <= 200:
+            return [types.TextContent(type="text", text="Error: 'batch_size' must be between 1 and 200.")]
 
         if not csv_path:
             return [types.TextContent(type="text", text="Error: 'csv_path' is required.")]
         if not os.path.exists(csv_path):
             return [types.TextContent(type="text", text=f"Error: File not found: {csv_path}")]
-        if tool not in ("claude", "codex", "gemini", "agy", "qwen", "ollama"):
-            return [types.TextContent(type="text", text="Error: 'tool' must be 'claude', 'codex', 'gemini', 'agy', 'qwen', or 'ollama'.")]
+        if tool == "gemini":
+            return [types.TextContent(type="text", text="Error: Gemini CLI shut down on June 18, 2026. Use tool 'agy' (Antigravity), its replacement.")]
+        if tool not in ("claude", "codex", "agy", "qwen", "ollama"):
+            return [types.TextContent(type="text", text="Error: 'tool' must be 'claude', 'codex', 'agy', 'qwen', or 'ollama'.")]
 
         if tool == "ollama":
             # No CLI binary; verify the Ollama server is reachable instead.
@@ -3077,6 +3836,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         # Working copy
         base, ext = os.path.splitext(csv_path)
         work_path = f"{base}_annotating{ext}"
+        raw_path = f"{base}_annotating_raw.jsonl"
         if not os.path.exists(work_path):
             shutil.copy2(csv_path, work_path)
 
@@ -3118,13 +3878,17 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
             "done": 0,
             "errors": [],
             "work_path": work_path,
+            "raw_path": raw_path,
             "tool": tool,
+            "batch_size": batch_size,
             "cancelled": False,
         }
 
         t = threading.Thread(
             target=_annotation_job_worker,
             args=(job_id, rows, fieldnames, unannotated, schema, work_path, tool, tool_path, model, timeout, reasoning_effort, ollama_base_url),
+            kwargs={"batch_size": batch_size, "no_api_key": no_api_key, "raw_path": raw_path,
+                    "instructions": instructions, "keep_claude_code_prompt": keep_claude_code_prompt},
             daemon=True
         )
         t.start()
@@ -3133,8 +3897,13 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
             f"Annotation job started.\n"
             f"Job ID: {job_id}\n"
             f"Tool: {tool} ({tool_path})\n"
-            f"Rows to annotate: {len(unannotated)} of {len(rows)}\n"
-            f"Working file: {work_path}\n\n"
+            f"Rows to annotate: {len(unannotated)} of {len(rows)}"
+            + (f", {batch_size} per call" if batch_size > 1 else "") + "\n"
+            + (f"Instructions: {len(instructions):,} characters, sent once per call\n" if instructions else "")
+            + (f"Claude Code's own system prompt: {_claude_code_prompt_label(tool, tool_path, keep_claude_code_prompt)}\n"
+               if tool == "claude" else "")
+            + f"Working file: {work_path}\n"
+            f"Raw replies: {raw_path}\n\n"
             f"Use get_annotation_job_status(job_id='{job_id}') to check progress."
         ))]
 
@@ -3158,6 +3927,15 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
             f"Tool: {job['tool']}",
             f"Output: {job['work_path']}",
         ]
+        if job.get("raw_path"):
+            lines.append(f"Raw replies: {job['raw_path']}")
+        if job["status"] == "stopped_at_limit":
+            lines.append(
+                "Stopped: the plan's usage limit was hit. Every saved row is kept. "
+                "Run run_annotation_job again with the same csv_path once the limit resets to continue."
+            )
+            if job.get("limit_message"):
+                lines.append(f"  The CLI said: {job['limit_message']}")
         if errors:
             lines.append(f"Errors ({len(errors)}):")
             for e in errors[-5:]:  # show last 5
@@ -3465,6 +4243,45 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         result_contents.append(types.TextContent(type="text", text=reply))
         return result_contents
 
+    elif name == "wake_on_message":
+        persona = arguments.get("as_agent")
+        note, coord_err = _coord_target()
+        if coord_err:
+            return [types.TextContent(type="text", text=coord_err)]
+        me = persona or _agent_id
+        session = _target_session or "default"
+        try:
+            timeout_s = max(float(arguments.get("timeout_s") or 0), 0.0)
+        except (TypeError, ValueError):
+            timeout_s = 0.0
+        cmd = _wake_command(session, me, timeout_s)
+        waiting = len(_coord_unread(as_agent=persona))
+        lines = [
+            f"Run this as a background command. It finishes as soon as a coordination "
+            f"message for '{me}' arrives on session '{session}', and your app wakes you "
+            f"when it does, so you need no timers and no checking in the meantime:",
+            "",
+            cmd,
+            "",
+            "Claude Code: the Bash tool with run_in_background set to true. Antigravity: "
+            "run it as a command; it carries on in the background and you are told when it "
+            "finishes. Do not run it in the foreground, where it would hold you until a "
+            "message comes.",
+            "",
+            "When it finishes: call check_messages, which marks the messages read, deal with "
+            "them, then run the same command again to keep listening. If you change your "
+            "name with set_agent_name, ask for a new command, since it listens by name.",
+        ]
+        if waiting:
+            lines += ["", f"You already have {waiting} unread message"
+                          f"{'' if waiting == 1 else 's'}, so it would finish at once. "
+                          "Read them with check_messages first."]
+        reply = "\n".join(lines)
+        if note:
+            reply = note + "\n" + reply
+        result_contents.append(types.TextContent(type="text", text=reply))
+        return result_contents
+
     elif name == "wait_for_message":
         timeout_s = min(float(arguments.get("timeout_s", 300)), 1800.0)
         from_agent = arguments.get("from_agent")
@@ -3504,6 +4321,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
 
     elif name == "coordination_roster":
         stale_after = float(arguments.get("stale_after_s", 900))
+        hide_after = float(arguments.get("hide_after_s", 86400))
         note, coord_err = _coord_target()
         if coord_err:
             return [types.TextContent(type="text", text=coord_err)]
@@ -3517,16 +4335,35 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
         for ev in events:
             last[ev.get("from", "?")] = ev.get("ts", "")
         lines = []
+        hidden = 0
         now = datetime.now()
         for agent_name, ts in sorted(last.items()):
             try:
                 seen = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
                 ago = (now - seen).total_seconds()
+                # The log is append-only, so every agent that ever wrote to
+                # this session name is still in it. Reused names (and
+                # "default" above all) collect agents for weeks, and an agent
+                # last seen 19 days ago is noise on every roster call. Keep
+                # them in the log, just stop listing them.
+                if ago > hide_after:
+                    hidden += 1
+                    continue
                 flag = " [STALE]" if ago > stale_after else ""
                 lines.append(f"  {agent_name}: last seen {round(ago)}s ago{flag}")
             except ValueError:
                 lines.append(f"  {agent_name}: last seen {ts}")
-        reply = "Coordination roster:\n" + "\n".join(lines)
+        if not lines:
+            reply = ("No agent has been active on this session within the last "
+                     f"{round(hide_after / 3600)}h")
+            if hidden:
+                reply += f" ({hidden} older, still in the log)"
+            reply += "."
+        else:
+            reply = "Coordination roster:\n" + "\n".join(lines)
+            if hidden:
+                reply += (f"\n  ({hidden} agent(s) not seen in over "
+                          f"{round(hide_after / 3600)}h, hidden; raise hide_after_s to show them)")
         if note:
             reply = note + "\n" + reply
         result_contents.append(types.TextContent(type="text", text=reply))
@@ -3661,6 +4498,10 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[types.TextCont
 # Run the server
 async def main():
     global _agent_id
+
+    # `clauder-mcp wait ...` is the wake-up waiter, not the MCP server.
+    if len(sys.argv) > 1 and sys.argv[1] == "wait":
+        sys.exit(_wait_main(sys.argv[2:]))
 
     args = parse_args()
     global _agent_id_source

@@ -26,6 +26,41 @@ coord_dir <- function(session = NULL) {
 
 coord_log_path <- function(session = NULL) file.path(coord_dir(session), "events.jsonl")
 
+# Set a session's message board aside for a fresh start. The board is keyed
+# by session name, not by the R process, so without this a reused name hands
+# every new agent the whole history on its first check_messages. The log and
+# every agent's read position move into archive/<time>/ inside the session's
+# board folder; nothing is deleted. Read positions move too, because message
+# ids are line numbers: an agent whose old position was 491 would otherwise
+# skip the first 491 messages of the new board. Returns the archive folder
+# and the number of messages moved, or NULL when there was nothing to move.
+archive_coord_board <- function(session = NULL) {
+  d <- coord_dir(session)
+  files <- c(file.path(d, "events.jsonl"),
+             list.files(d, pattern = "^cursor_.*[.]txt$", full.names = TRUE))
+  files <- files[file.exists(files) & file.size(files) > 0]
+  if (length(files) == 0) return(NULL)
+  log <- file.path(d, "events.jsonl")
+  n_msgs <- if (log %in% files) {
+    sum(nzchar(readLines(log, warn = FALSE)))
+  } else 0L
+  stamp <- format(Sys.time(), "%Y%m%d-%H%M%S")
+  dest <- file.path(d, "archive", stamp)
+  k <- 1L
+  while (dir.exists(dest)) {
+    k <- k + 1L
+    dest <- file.path(d, "archive", paste0(stamp, "-", k))
+  }
+  dir.create(dest, recursive = TRUE, mode = "0700")
+  moved <- file.rename(files, file.path(dest, basename(files)))
+  if (!all(moved)) {
+    stop(sprintf(
+      "Fresh start could not move %s into %s. Nothing was deleted and the server was not started.",
+      paste(basename(files[!moved]), collapse = ", "), dest), call. = FALSE)
+  }
+  list(dir = dest, messages = n_msgs)
+}
+
 # The calling agent's identity. execute_code_in_session() sets
 # CLAUDER_AGENT_ID around each evaluation, so agent code gets correct
 # attribution with no arguments; humans at the console default to "user".
@@ -252,11 +287,13 @@ claim_state <- function(task, session = NULL) {
 #' that have nothing to say.
 #'
 #' @param stale_after_s Seconds after which an agent is flagged stale.
+#' @param hide_after_s Omit agents not seen for this long (default one day).
+#'   The log itself is unchanged; pass `Inf` to list every agent it holds.
 #' @param agent Identity stamped by `cr_ping()`; defaults to the executing agent.
 #' @param session Session name; defaults to the active session.
 #' @return data.frame of agent, last_seen, seconds_ago, stale.
 #' @export
-cr_roster <- function(stale_after_s = 900, session = NULL) {
+cr_roster <- function(stale_after_s = 900, hide_after_s = 86400, session = NULL) {
   evs <- coord_events(session)
   if (length(evs) == 0) {
     return(data.frame(agent = character(0), last_seen = character(0),
@@ -272,7 +309,21 @@ cr_roster <- function(stale_after_s = 900, session = NULL) {
                seconds_ago = round(ago), stale = ago > stale_after_s,
                stringsAsFactors = FALSE)
   }))
-  out[order(out$seconds_ago), ]
+  # The log is append-only, so it holds every agent that ever wrote to this
+  # session name. A reused name ("default" most of all) accumulates agents for
+  # weeks, and one last seen 19 days ago is noise. Keep them in the log, just
+  # do not return them. Pass hide_after_s = Inf for the full history.
+  out <- out[order(out$seconds_ago), ]
+  if (is.finite(hide_after_s)) {
+    dropped <- sum(out$seconds_ago > hide_after_s)
+    out <- out[out$seconds_ago <= hide_after_s, , drop = FALSE]
+    if (dropped > 0) {
+      attr(out, "hidden") <- dropped
+      message(sprintf("%d agent(s) not seen in over %gh are hidden; pass hide_after_s = Inf to see them.",
+                      dropped, hide_after_s / 3600))
+    }
+  }
+  out
 }
 
 #' @rdname cr_roster
@@ -436,18 +487,53 @@ format_coord_event <- function(e) {
           substr(e$ts, 12, 19), e$from, e$to, e$type, body_txt)
 }
 
+# Id of the last event in the log, 0 when the log is missing or empty.
+coord_last_id <- function(evs) {
+  if (length(evs) == 0) return(0L)
+  max(vapply(evs, function(e) as.integer(e$id), integer(1)))
+}
+
+# Which events the addin's echo should print, given the last id it printed.
+# Start Server sets `seen` to the log's length at that moment, so only events
+# from before the server started are skipped. (The echo used to take its
+# baseline on first sight, which swallowed the first event of a run whenever
+# the log started empty.) A log shorter than `seen` was cleared, for example by
+# deleting the folder to reset the agents' agreement, so all of it is new.
+# A NULL `seen` (no baseline recorded) skips what is there now.
+coord_unseen <- function(evs, seen) {
+  last <- coord_last_id(evs)
+  if (is.null(seen)) return(list(events = list(), seen = last))
+  if (last < seen) seen <- 0L
+  list(events = Filter(function(e) e$id > seen, evs), seen = last)
+}
+
 # Compact presence summary from the event log: who has written, how long ago.
-coord_roster_text <- function(session = NULL, stale_after = 900) {
+# Same one-day cutoff as cr_roster(): the log is append-only, so a reused
+# session name would otherwise list agents from weeks ago in the Agents panel
+# of a session that was just opened. Returns NULL when nobody is recent.
+coord_roster_text <- function(session = NULL, stale_after = 900,
+                              hide_after = 86400) {
   evs <- tryCatch(coord_events(session), error = function(err) list())
   if (length(evs) == 0) return(NULL)
   last <- list()
   for (e in evs) if (!is.null(e$from)) last[[e$from]] <- e$ts
+  if (length(last) == 0) return(NULL)
   now <- Sys.time()
-  parts <- vapply(names(last), function(nm) {
+  ago <- vapply(names(last), function(nm) {
     ts <- suppressWarnings(as.POSIXct(last[[nm]], format = "%Y-%m-%dT%H:%M:%OS"))
-    if (is.na(ts)) return(sprintf("%s (?)", nm))
-    ago <- round(as.numeric(difftime(now, ts, units = "secs")))
-    sprintf("%s (%ss ago%s)", nm, ago, if (ago > stale_after) ", STALE" else "")
+    if (is.na(ts)) NA_real_ else round(as.numeric(difftime(now, ts, units = "secs")))
+  }, numeric(1))
+  hidden <- sum(!is.na(ago) & ago > hide_after)
+  keep <- is.na(ago) | ago <= hide_after
+  if (!any(keep)) return(NULL)
+  ago <- ago[keep]
+  ago <- ago[order(ago, na.last = TRUE)]
+  parts <- vapply(names(ago), function(nm) {
+    a <- ago[[nm]]
+    if (is.na(a)) return(sprintf("%s (?)", nm))
+    sprintf("%s (%ss ago%s)", nm, a, if (a > stale_after) ", STALE" else "")
   }, character(1))
-  paste(parts, collapse = ", ")
+  txt <- paste(parts, collapse = ", ")
+  if (hidden > 0) txt <- sprintf("%s (+%d older, hidden)", txt, hidden)
+  txt
 }

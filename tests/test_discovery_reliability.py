@@ -74,13 +74,28 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn('48878', bridge.get_r_addin_url())
         self.assertEqual(bridge._target_token, 'new-token')
 
+    def test_lost_target_still_refuses_to_switch_names(self):
+        # Rebinding is only for the unambiguous same-name case. A bound name
+        # that vanishes while a different name is live must still refuse.
+        self.record()
+        bridge.get_r_addin_url()
+        os.remove(self.root / 'A.json')
+        self.record('B', port=48879)
+        with self.assertRaisesRegex(bridge.SessionBindingError, 'BOUND_SESSION_LOST'):
+            bridge.get_r_addin_url()
+        self.assertEqual(bridge._target_session, 'A')
+
     def test_multiple_sessions_require_selection(self):
         self.record()
         self.record('B', port=48879)
         with self.assertRaisesRegex(bridge.SessionBindingError, 'MULTIPLE_SESSIONS'):
             bridge.get_r_addin_url()
         result = asyncio.run(bridge.call_tool('list_sessions', {}))
-        self.assertIn('Active R sessions (2)', result[0].text)
+        # Sessions can be R or Python now, so the listing is language-tagged
+        # and no longer says "R sessions".
+        self.assertIn('Active sessions (2)', result[0].text)
+        self.assertIn('A [r]', result[0].text)
+        self.assertIn('B [r]', result[0].text)
 
     def test_no_sessions_does_not_guess_port(self):
         self.assertIsNone(bridge.get_r_addin_url())
@@ -98,6 +113,19 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_mirrors_identical(self):
         self.assertEqual((ROOT/'clauder-mcp/src/clauder_mcp/server.py').read_bytes(), (ROOT/'inst/scripts/persistent_r_mcp.py').read_bytes())
+
+    def test_settings_do_not_pick_an_unbound_or_lost_session(self):
+        self.record(tool_sets=['core'], plot_auto=True)
+        bridge.get_r_addin_url()
+        self.assertTrue(bridge._session_info()['plot_auto'])
+        self.record(tool_sets=['core'], plot_auto=False)
+        self.assertFalse(bridge._session_info()['plot_auto'])
+        (self.root/'A.json').unlink()
+        self.record('B', port=48879)
+        self.assertIsNone(bridge._session_info())
+        bridge._target_session = None
+        self.record('A')
+        self.assertIsNone(bridge._session_info())
 
 
 if __name__ == '__main__':

@@ -4,12 +4,21 @@ This repository is a fork of [IMNMV/ClaudeR](https://github.com/IMNMV/ClaudeR),
 not the upstream release channel. The original upstream README below remains
 available for its general tool documentation.
 
-The workbench compatibility line uses R package `0.16.6.9001` and bridge
+The workbench `0.7.0` candidate uses R package `0.16.6.9001` and bridge
 `0.16.6.post1` based on full upstream commit
-`3b56327527919b307b5466c3647ecb004e27775f`. Install both halves from
-the same immutable tag, then install
-[clauder-rstudio-workbench](https://github.com/lzhs1995/clauder-rstudio-workbench).
-Do not mix this R package with a bare PyPI `uvx clauder-mcp` invocation.
+`3b56327527919b307b5466c3647ecb004e27775f`. Use the exact ClaudeR source
+commit and critical-file hashes selected in the matching workbench's
+`runtime-compatibility.json`. Its `docs/UPGRADE_0.7.0.md` and Traditional
+Chinese companion describe isolated `paired_release stage` and `verify`
+commands for macOS and Windows. Stage defaults to a plan and creates the
+pair only with `--apply`. [Workbench repository](https://github.com/lzhs1995/clauder-rstudio-workbench)
+
+The candidate pair has completed isolated installation and loading on macOS
+and Windows. Independent MCP clients on both platforms listed 42 tools,
+including `wake_on_message` and the `wait_s` parameter of `get_async_result`.
+Full release acceptance, fixed public-source download verification, current
+client loading and complete research-pipeline verification remain in progress.
+Scientific results retain the software versions recorded by their original runs.
 
 Retained fork capabilities include async stage/message/update-time progress,
 file-backed stdout/stderr to prevent pipe backpressure, codebook writer

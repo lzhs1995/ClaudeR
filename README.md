@@ -20,6 +20,18 @@
 
 [English](README.md) · [繁體中文](README.zh-TW.md)
 
+## Workbench compatibility candidate
+
+This maintained fork supplies ClaudeR R `0.16.6.9001` and MCP bridge
+`0.16.6.post1` for the workbench `0.7.0` candidate. Install the pair from the
+fixed source selected by the workbench's `runtime-compatibility.json`, using
+its `docs/UPGRADE_0.7.0.md` guide. macOS and Windows isolated installations
+have loaded this pair and listed 42 MCP tools. Full release acceptance is
+still in progress. [Compatibility and validation scope](FORK_COMPATIBILITY.md)
+· [Workbench repository](https://github.com/lzhs1995/clauder-rstudio-workbench)
+
+The English guide below retains upstream ClaudeR's feature descriptions and
+upstream installation commands.
 
 **ClaudeR** connects MCP-configured LLM agents, like Claude Code or Codex, to the R session you are already working in. The agent runs code where your cleaned data and fitted models actually are, sees the plots it draws, reads the objects in your environment, and can edit the file open in your editor. A companion Python package does the same for a live Python session, and both work in RStudio and [Positron](https://positron.posit.co).
 

@@ -17,3 +17,4 @@ assets
 ^CITATION\.cff$
 ^\.mcpregistry_.*$
 ^\.pytest_cache$
+^R/ui\.R\.bak_plotfix$

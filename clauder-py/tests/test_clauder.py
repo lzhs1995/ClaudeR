@@ -78,7 +78,10 @@ class DiscoveryTests(Base):
         if sys.platform == "win32":
             # Independent Windows ACL observation; mode bits are not an ACL.
             env = dict(os.environ, CLAUDER_TEST_RECORD=path)
+            # pwsh 的模块搜索路径不能传给 Windows PowerShell 5.1。
+            env = {k: v for k, v in env.items() if k.upper() != "PSMODULEPATH"}
             script = """$ErrorActionPreference='Stop'
+Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
 $a=Get-Acl -LiteralPath $env:CLAUDER_TEST_RECORD
 [pscustomobject]@{ protected=$a.AreAccessRulesProtected;
  user=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;

@@ -2,7 +2,7 @@
   <img src="assets/logo.svg" alt="ClaudeR Logo" width="180"/>
   <h1>ClaudeR - The Modern Researcher's Toolkit</h1>
   <p>
-    <b>Connect RStudio to Claude Code, Codex, Gemini CLI, or any MCP-based LLM agent for interactive coding, multi-agent orchestration, and automated manuscript auditing.</b>
+    <b>Connect a live R or Python session, in RStudio or Positron, to Claude Code, Codex, or any MCP-based LLM agent. For interactive analysis, multi-agent orchestration, and automated manuscript auditing.</b>
   </p>
   <p>
     <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
@@ -13,28 +13,31 @@
     <a href="https://github.com/IMNMV/ClaudeR/commits/main"><img src="https://img.shields.io/github/last-commit/IMNMV/ClaudeR/main" alt="GitHub last commit"></a>
     <a href="https://pypi.org/project/clauder-mcp/"><img src="https://img.shields.io/pypi/v/clauder-mcp" alt="PyPI version"></a>
     <img src="https://img.shields.io/badge/R-%3E%3D4.0-blue?logo=r" alt="R version">
+    <img src="https://img.shields.io/badge/Python-%3E%3D3.9-blue?logo=python&logoColor=white" alt="Python version">
     <a href="https://glama.ai/mcp/servers/IMNMV/ClaudeR"><img src="https://glama.ai/mcp/servers/IMNMV/ClaudeR/badges/score.svg" alt="ClaudeR MCP server"></a>
   </p>
 </div>
 
 [English](README.md) · [繁體中文](README.zh-TW.md)
 
-> **LZHS workbench users:** this is the compatibility fork, not the upstream
-> install channel. Read [FORK_COMPATIBILITY.md](FORK_COMPATIBILITY.md) for the
-> paired R/bridge versions, fork extensions and reliability checks before using
-> the upstream Quick Start below.
+## Workbench compatibility candidate
 
----
+This maintained fork supplies ClaudeR R `0.16.6.9001` and MCP bridge
+`0.16.6.post1` for the workbench `0.7.0` candidate. Install the pair from the
+fixed source selected by the workbench's `runtime-compatibility.json`, using
+its `docs/UPGRADE_0.7.0.md` guide. macOS and Windows isolated installations
+have loaded this pair and listed 42 MCP tools. Full release acceptance is
+still in progress. [Compatibility and validation scope](FORK_COMPATIBILITY.md)
+· [Workbench repository](https://github.com/lzhs1995/clauder-rstudio-workbench)
 
-> **Heads up: a name change is coming.** Another R package already uses the name claudeR, so this package will be renamed in the next couple of weeks. Only the name will change. The tools, the installers, and your workflows stay exactly the same. Install instructions here will be updated the day it happens.
+The English guide below retains upstream ClaudeR's feature descriptions and
+upstream installation commands.
 
----
+**ClaudeR** connects MCP-configured LLM agents, like Claude Code or Codex, to the R session you are already working in. The agent runs code where your cleaned data and fitted models actually are, sees the plots it draws, reads the objects in your environment, and can edit the file open in your editor. A companion Python package does the same for a live Python session, and both work in RStudio and [Positron](https://positron.posit.co).
 
-**ClaudeR** is an R package that forges a direct link between RStudio and MCP configured LLM agents like Claude Code or Codex. This allows interactive coding sessions where the agent can execute code in your active RStudio environment so it can see the executed code and any generated plots in real-time. If you need help editing a script, a quick analysis done, or an LLM to audit your statistical claims against any manuscript before submission: ClaudeR has got your back.
+Several agents can share one session and divide the work between them, or you can run separate sessions side by side so each agent works on its own dataset without touching the others.
 
-This package, additionally, allows multiple agents to work on one script, or it can make multiple RStudio windows siloed so multiple agents can operate independently on different datasets. It's also compatible with Cursor and any service that support MCP servers.
-
-**Why this instead of the subscription tools?** Most paid "AI for researchers" products are workflow wrappers: a prompt, a free public API, and the same frontier models you already pay for through a CLI subscription. ClaudeR's answer is structural, beyond just price. The work happens in your live R session, where your actual data and models live, with a per-agent audit trail of every line executed, checkpoints that make any step reversible, and findings written back into your actual documents as Word comments. A web wrapper cannot offer any of that.
+It covers much of what a paid research AI tool does, with the work happening in your own session and a record of every line an agent ran.
 
 ## Quick Start
 
@@ -50,12 +53,39 @@ install_cli(tools = "claude")  # For Claude Code CLI
 
 # Start the server in RStudio
 claudeAddin()
+
+# Or from any R console, with no window (terminal R, a cluster, Rscript)
+start_server()
 ```
 
 > **AI agents:** See [llms-install.md](llms-install.md) for automated setup instructions.
 
+## Demo
+
+| Single agent via Claude Desktop App | Multi-agent: Codex + Claude Code via CLI | GPT 5.4 Codex: Data analysis + Quarto report |
+|:---:|:---:|:---:|
+| [![Single Agent Demo](https://img.youtube.com/vi/KSKcuxRSZDY/0.jpg)](https://youtu.be/KSKcuxRSZDY) | [![Multi-Agent Demo](https://img.youtube.com/vi/5ZMyfR6ZvYU/0.jpg)](https://youtu.be/5ZMyfR6ZvYU) | [![Codex Quarto Demo](https://img.youtube.com/vi/TE-U8DPlShY/0.jpg)](https://youtu.be/TE-U8DPlShY) |
+
 <details>
 <summary><b>Recent Updates</b> (click to expand)</summary>
+
+- **Agents are woken when a message arrives (clauder-mcp 0.16.6).** From a user request. An idle agent used to learn about a new message only by setting its own timer and checking. MCP gives a tool server no way to wake a model, but Claude Code and Antigravity both wake the agent when a command it left running in the background finishes. The new `wake_on_message` tool hands the agent such a command. It sits quietly until a message for that agent lands on the board, then finishes, and the agent's app wakes it to read the message. It marks nothing as read, so a message is never lost. It quits by itself if the app that started it closes. Agents don't need telling: the short introduction the bridge gives every agent on its first tool call says to keep one running whenever it waits on another agent, and so does the multi-agent protocol.
+- **Fresh start gives agents an empty message board (R 0.16.6).** From a user report. The message board belongs to the session name, not to the R session, so a reused name such as "default" kept every message ever sent under it, and each new agent read all of them on its first check. Ticking **Fresh start on restart**, or `start_server(fresh_start = TRUE)`, now moves the old messages and every agent's read position to an `archive` folder inside `~/.clauder_coord/<session name>`, so agents start on an empty board. Nothing is deleted. It will not touch the board of a name another live R session is using.
+- **ClaudeR without RStudio (R 0.16.6).** `start_server()` starts the server from any R console, so terminal R, a tmux pane, an ssh login on a cluster and `Rscript` all work. At a prompt it returns at once and agents are served while R is idle. Under `Rscript` it serves until interrupted. The editor tools are left out there, since there is no editor, and when R has no screen, plots go to a hidden image device so the agent still sees them. It works inside RStudio and Positron too, where it leaves the console free. `stop_server()` stops it. See [Terminal R and Clusters](#terminal-r-and-clusters).
+- **Labelling calls run without Claude Code's own system prompt (clauder-mcp 0.16.5).** Claude Code gives the model a long block of built-in instructions before anything you type: that it is a command-line coding assistant, how to use Bash and the file tools, how to format replies for a terminal, how to handle git, when to ask permission, and so on. A labelling call has no tools, files or terminal for any of that to apply to, and it can colour the answers, so `run_annotation_job` now blanks it: each Claude call gets an empty system prompt, or just your `instructions`. `keep_claude_code_prompt = true` keeps it, for matching runs made before this version. A Claude Code without the `--system-prompt` option keeps it either way, and the first line of the raw replies file records which happened. `no_api_key` now removes every `ANTHROPIC_*` variable, not just the key and token, so a custom base URL can't route the call to a metered key either.
+- **The first agent message reaches the log, and plot capture tidies up after itself (R 0.16.5).** Found during a two-agent demo. When the coordination log started empty, the addin treated the first message of the run as old history, so it never reached the console or the session log. It now skips only what was already in the log when you pressed Start Server, and a log you clear mid-run is shown from its first message. Separately, when copying a plot for the agent failed, the hidden image device the copy had opened stayed open. It is now always closed, and your current graphics device is left as it was.
+- **Annotation instructions given once (clauder-mcp 0.16.4).** From a user's run. Task instructions had to go in a column copied onto every row, which bloated the file and repeated them for every row in a batch. `run_annotation_job` now takes `instructions` once and gives them to every call ahead of the rows. Claude gets them as a system prompt, so long instructions can be reused from call to call instead of paid for in full each time. The instructions are recorded at the top of the raw replies file.
+- **Gemini CLI removed (R 0.16.4 / clauder-mcp 0.16.3).** Google shut Gemini CLI down on June 18, 2026, and Antigravity (`agy`) replaced it. `install_cli(tools = "gemini")` and the `gemini` option of `run_annotation_job` are gone, and both now point you to `agy` instead.
+- **Labelling calls see only the row (clauder-mcp 0.16.3).** `run_annotation_job` now starts each Claude call with no tools, MCP servers, hooks, CLAUDE.md or slash commands, from an empty folder, so the model labelling a row sees nothing but that row (installed plugins are still listed but have nothing to run through). Older Claude Code versions get whichever of these options they have. Codex calls also start from an empty folder. Every reply is kept word for word in `{name}_annotating_raw.jsonl`. A reply that isn't valid JSON or doesn't fit the schema is asked again, up to three tries. Hitting your plan's usage limit stops the job with every saved row kept, and running it again picks up where it stopped. Two new options: `no_api_key = true` removes API keys from each call so the CLI uses your subscription login, and `batch_size` sends several rows per call for very large jobs (the default stays 1, so no row can influence another). A crash no longer leaves a job reading "running" forever, and the working file is never left half written.
+- **The exported script reruns, and checkpoints restore by name (R 0.16.4).** Found rehearsing a demo. When an agent's code failed, the exported clean script kept that code as live code, so rerunning the script stopped at the same error; it now appears once, commented out. `restore_session("before_filter")` failed with "checkpoint not found" because only the stamped file name was accepted; the label a checkpoint was saved with now works, and a miss lists the checkpoints that exist.
+
+- **Console logging turns on when it says it is on (R 0.16.3).** From a user report. "Also log my own console commands" is remembered between sessions and the box comes back ticked, but after restarting R nothing was being recorded until the box was unticked and ticked again. It now starts with the server. Calling `start_console_logging()` before starting a session also said logging was on while writing nowhere; it now says commands are recorded once a session starts, and they are. Starting a session prints where its log is, and your commands are no longer appended to the previous session's log while the server is stopped.
+
+- **Fewer check-ins on long jobs, nothing lost from long output, a quieter Agents panel (R 0.16.2 / clauder-mcp 0.16.2).** `get_async_result` now waits for the job and returns the moment it finishes (up to `wait_s` seconds, default 300), so a 20-minute model fit takes a handful of calls instead of about 120. When output is too long to send in full, the whole thing is saved to a file and the agent is told where, so it can read the part that was cut instead of running the code again. The addin's Agents panel now hides agents not seen in a day, like `cr_roster()` already did, so a freshly opened session no longer lists agents from weeks ago.
+
+- **Console logging from the addin fixed (R 0.14.2).** Ticking "Also log my own console commands" in the addin armed nothing on 0.14.1, while calling `start_console_logging()` in the console worked. Cause: `globalCallingHandlers()` (used to observe warnings and messages) can only be called with an empty handler stack, and inside the Shiny observer that handles the checkbox it errors, which aborted the function before the console callback was registered. The callback is now registered first and unconditionally; the handlers are installed only when logging is started from the console, and otherwise warnings are read from `last.warning` after each command. Started from the addin, `message()` output is the one thing not captured, and the addin says so.
+
+- **Control what reaches the agent, and stop sending plots nobody saw (R 0.15.0 / clauder-mcp 0.15.0).** From two user requests. A new AGENT CONTEXT panel in the addin does two things. "Send plots to the agent automatically" can be turned off: the agent is told a plot was drawn and asks for it with `execute_r_with_plot`, saving roughly 4,500 tokens per image when you mostly want text. Your Plots pane is unaffected either way. "Tools available to the agent" hides whole groups you are not using (editor, session, coordination, background jobs, manuscript audit); all 41 tools cost about 8,600 tokens of schema on every request, and a programming-only session needs about 1,200 of that. Both settings are per session and take effect without a restart, though some MCP clients only notice a changed tool list on reconnect. Separately, a bug fix: `p <- ggplot(...)` returned a full image to the agent even though assignment displays nothing, so the agent was sent plots that never appeared in your Plots pane. Capture now requires the plot to have actually been shown.
 
 - **Logging fixes (R 0.14.1).** Two problems from a user report. Agent output was never written to the log, only the code, because the entry was written before the code ran; the log now records what each call printed. And the output capture added in 0.14.0 could stop console logging entirely: it opened its own output sink before registering the console callback, so if that sink could not be opened, nothing was logged at all. Opening it is now optional and failing back to logging commands and their values, the sink is restored if another execution unwinds it, and an agent run no longer pops a sink it did not open. Logged output lines are marked so that replay, history and notebook export skip them.
 
@@ -105,7 +135,7 @@ claudeAddin()
 - **Multi-agent orchestration.** Run multiple AI agents on the same R session or spread them across separate RStudio windows. Each agent gets a unique ID on startup. Console output, log files, and execution history are all attributed per agent, so you always know who did what. On its very first tool call, each agent receives a context briefing with its own ID, any other agents active on the session, and the log file path, giving it full awareness of the shared environment without any manual setup. Agents can call `get_session_history` to review what other agents have done, or read the shared log file directly. The Shiny viewer tracks connected agents in real-time.
 - **Session discovery.** Each RStudio session writes a discovery file to `~/.claude_r_sessions/` on startup. AI agents find sessions automatically with no hardcoded ports. Name your sessions (e.g. "analysis", "modeling") and run them on different ports. When multiple sessions exist, agents automatically route to the session named "default". Non-default agents should call `connect_session` to bind to their target session. Single-session setups work with zero config.
 - **Redesigned Shiny viewer.** Cleaner UI with grouped panels for Session, Agents, Logging, and Advanced settings. Shows connected agents and execution count in real-time. Click the `?` button for a built-in guide on multi-session setup and agent identity.
-- **Non-blocking async execution.** `execute_r_async` now runs long-running code in a separate R process via `callr`, keeping the main session fully responsive. Other agents can continue working while a job runs. The agent writes self-contained code (explicitly saving/loading data via `saveRDS`), submits it, and polls with `get_async_result`. No environment copying and no memory doubling, only the data the job needs gets serialized.
+- **Non-blocking async execution.** `execute_r_async` now runs long-running code in a separate R process via `callr`, keeping the main session fully responsive. Other agents can continue working while a job runs. The agent writes self-contained code (explicitly saving/loading data via `saveRDS`), submits it, and collects the result with `get_async_result`. No environment copying and no memory doubling, only the data the job needs gets serialized.
 - **Stale plot detection.** Fixed a bug where the last generated plot image would persist and re-appear on every subsequent `execute_r` call, even when no new plot was created.
 - **Reduced plot token usage.** Plot capture now uses smaller dimensions (600x400, dpi 100) to reduce base64 image size and avoid token overflow errors.
 - **MCP tool annotations.** All tools now include `readOnlyHint`, `destructiveHint`, and `idempotentHint` annotations per the current MCP spec.
@@ -114,16 +144,12 @@ claudeAddin()
 
 </details>
 
-## Demo
-
-| Single agent via Claude Desktop App | Multi-agent: Codex + Claude Code via CLI | GPT 5.4 Codex: Data analysis + Quarto report |
-|:---:|:---:|:---:|
-| [![Single Agent Demo](https://img.youtube.com/vi/KSKcuxRSZDY/0.jpg)](https://youtu.be/KSKcuxRSZDY) | [![Multi-Agent Demo](https://img.youtube.com/vi/5ZMyfR6ZvYU/0.jpg)](https://youtu.be/5ZMyfR6ZvYU) | [![Codex Quarto Demo](https://img.youtube.com/vi/TE-U8DPlShY/0.jpg)](https://youtu.be/TE-U8DPlShY) |
-
 ## Table of Contents
 
 - [Quick Start](#quick-start)
 - [Features](#features)
+- [Python Sessions and Positron](#python-sessions-and-positron)
+- [Terminal R and Clusters](#terminal-r-and-clusters)
 - [How It Works](#how-it-works)
 - [Reviewer Zero](#reviewer-zero-automated-academic-audits)
 - [R Best Practices Protocol](#r-best-practices-protocol)
@@ -151,7 +177,7 @@ ClaudeR empowers your AI assistant with a suite of tools to interact with your R
 - **`execute_r`**: Execute R code and return the output.
 - **`execute_r_with_plot`**: Execute R code that generates a plot that the model can see.
 - **`execute_r_async`**: Execute long-running R code asynchronously (>25 seconds). Returns a job ID for polling.
-- **`get_async_result`**: Poll for the result of an async job. Includes a built-in delay to throttle polling.
+- **`get_async_result`**: Wait for an async job and return its result the moment it finishes (up to `wait_s` seconds, default 300). `wait_s = 0` just checks.
 - **`list_sessions`**: List all active RStudio sessions the agent can connect to.
 - **`connect_session`**: Connect to a specific RStudio session by name for multi-session workflows.
 - **`get_session_history`**: View execution history filtered by agent ID.
@@ -173,9 +199,9 @@ ClaudeR empowers your AI assistant with a suite of tools to interact with your R
 - **`get_bibtex`**: Fetch the canonical BibTeX entry for a DOI via doi.org content negotiation.
 - **`generate_notebook`**: Turn a session log into a narrated Quarto lab notebook. Rendering re-runs the code so outputs and plots regenerate.
 - **`generate_codebook`**: Scan a project and emit the codebook OSF and journals require: versioned package list, script inventory, per-variable summaries (class, n, missingness), and outputs produced.
-- **`annotate_manuscript()`** (R function, driven by Reviewer Zero's write-back step): inject audit findings into a .docx as native Word comments the author can accept or dismiss.
 - **`screening_report`**: Summarize systematic-review screening passes. Computes agreement and Cohen's kappa between two model screeners, the PRISMA flow counts, and the conflict set a human must adjudicate.
 - **`send_message` / `check_messages` / `wait_for_message` / `coordination_roster`**: Typed multi-agent messaging on an append-only shared log. `wait_for_message` blocks until a matching event arrives (rendezvous without polling), and everything works even while the R session is busy executing another agent's code.
+- **`wake_on_message`**: Gives an idle agent a command to run in the background that finishes when a message for it arrives, so its app wakes it. No timers, no repeated checking. Works in any app that tells the agent when a background command finishes, including Claude Code and Antigravity.
 - **`checkpoint_session`**: Snapshot the R global environment to disk before risky operations. Checkpoints survive R restarts.
 - **`restore_session`**: Roll the environment back to a checkpoint. The current state is saved first, so a restore is itself undoable. Also callable from the console (`ClaudeR::restore_session()`) when you need to recover from an agent mistake yourself.
 - **`list_checkpoints`**: List saved checkpoints for the current session.
@@ -188,7 +214,7 @@ With these tools, you can:
 - **Feedback & Assistance**: Get explanations of your R scripts or request edits at specific lines.
 - **Visualization**: The AI can generate, view, and refine plots and visualizations.
 - **Data Analysis**: Let the AI analyze your datasets and iteratively provide insights.
-- **Multi-Agent Workflows**: Run Claude Desktop, Claude Code, and Gemini CLI on the same R session simultaneously. Each agent is uniquely identified, and they can see each other's work through shared history and log files.
+- **Multi-Agent Workflows**: Run Claude Desktop, Claude Code, Codex, and Antigravity on the same R session simultaneously. Each agent is uniquely identified, and they can see each other's work through shared history and log files.
 - **Long-Running Analysis**: Async execution handles model fitting, simulations, and large data processing without timing out.
 - **Code Logging**: Save all code executed by the AI to log files for future reference. Every entry is tagged with the agent that ran it.
 - **Console Printing**: Print the AI's code to the console before execution.
@@ -262,6 +288,10 @@ You can also just tell the agent to run `ClaudeR::r_best_practices_prompt()` and
 
 When two or more agents share the same RStudio session, they need a way to divide work without stepping on each other. Coordination v2 runs on a typed, append-only event log on disk, shared by the R session and every agent's bridge: typed signals instead of prose conventions, per-agent read cursors (so no agent can clobber another's state), `to:` addressing with reply threading, lease-based task claims, a latest-wins fact store for shared state, presence stamped by every write, and `wait_for_message` so an agent can block until its partner's signal arrives instead of polling. The log survives R restarts.
 
+**Being woken instead of checking.** An idle agent doesn't need a timer. It calls `wake_on_message` once and runs the command it gets back as a background command. In Claude Code that means the Bash tool with `run_in_background`. In Antigravity, the command carries on in the background by itself. The command finishes the moment a message for that agent lands, and the app wakes the agent, which reads with `check_messages` and starts the command again. MCP itself has no way for a tool server to wake a model, which is why this goes through the app's own background commands.
+
+The board belongs to the session name, so a session that reuses a name picks up its old messages, and an agent new to the board reads all of them on its first check. To start clean, tick **Fresh start on restart** in the addin, or run `start_server("name", fresh_start = TRUE)`. The old board moves to an `archive` folder inside `~/.clauder_coord/<session name>` and is never deleted. A name nobody has used starts empty anyway. The archive is still a file on your computer, so an agent that runs R code can read it if it goes looking.
+
 The centerpiece is the **consensus gate**: when an agent proposes a plan with `propose_plan()`, every code-execution response in the session carries a banner demanding explicit agreement until every agent has run `confirm_agreement()` with a required sentence, verbatim. Agents cannot talk past each other into conflicting work: the plan is only marked approved when all parties have confirmed they read each other's position and agree.
 
 ```r
@@ -294,6 +324,19 @@ data_annotation_prompt()
 
 Or tell the agent to run `ClaudeR::data_annotation_prompt()` and it will read the protocol itself. The agent then calls `load_annotation_data` to start and `annotate` to label each row. The original file is never modified, and sessions are automatically resumable if interrupted.
 
+**Running it in the background:** for a bigger file, `run_annotation_job` labels every row in the background, each in a fresh call to claude, codex, agy, qwen or a local ollama model that sees only that row.
+
+- Each Claude call starts in an empty folder with no tools, MCP servers, hooks, CLAUDE.md or slash commands, so nothing but the row reaches the model. Claude Code still lists your installed plugins, but they have nothing to run through. Codex calls also start in an empty folder.
+- Claude Code's own system prompt is left out too. That's the long block of built-in instructions Claude Code gives the model before anything you type: that it's a command-line coding assistant, how to use Bash and the file tools, how to format replies for a terminal, git habits, when to ask permission, and so on. A labeller has no tools, files or terminal for any of it to apply to, and it can colour the answers, so each call gets an empty system prompt (or just your `instructions`). Pass `keep_claude_code_prompt = true` to keep it, for example to match a run made before clauder-mcp 0.16.5. A Claude Code without the `--system-prompt` option keeps it either way; the first line of the raw replies file says which happened.
+- `instructions` takes your task instructions or codebook once and gives them to every call ahead of the rows, so you don't have to copy them into a column on every row. Claude gets them as the system prompt (the whole of it, unless you keep Claude Code's own), which stays the same from call to call and can be reused between calls. They're recorded at the top of the raw replies file.
+- Labels go to `{name}_annotating.csv`, and every reply is kept word for word in `{name}_annotating_raw.jsonl`, so you can check what the model actually said.
+- A reply that isn't valid JSON or doesn't fit the schema is asked again, up to three times.
+- If you hit your plan's usage limit, the job stops with every saved row kept. Run it again later and it picks up where it stopped.
+- `no_api_key = true` removes API keys from each call (for Claude, every `ANTHROPIC_*` variable, so a custom base URL can't route the call to a key either), so the CLI uses your subscription login and never bills a key. Leave it off if an API key is how you sign in.
+- `batch_size` sends several rows per call for very large jobs. The default is 1, which keeps one row from influencing another. Raise it only when speed matters more than that.
+
+Check on a job with `get_annotation_job_status`, or stop it with `cancel_annotation_job`.
+
 ## Systematic Review Screening
 
 Title and abstract screening is the slowest part of a systematic review. Two humans normally read every record. ClaudeR replaces the bulk reading with two independent AI screeners and leaves the human only the disagreements.
@@ -325,6 +368,110 @@ The revise-and-resubmit workflow, compressed. Give the agent the decision letter
 
 The deliverables: a formatted response letter via `export_response_letter()` (markdown, plus .docx when pandoc is installed), and your manuscript annotated with a Word comment at each spot that needs an edit, tagged with the reviewer point it answers.
 
+## Python Sessions and Positron
+
+ClaudeR also connects an agent to a live **Python** session, and both halves work in
+[Positron](https://positron.posit.co) as well as RStudio.
+
+```python
+import clauder
+clauder.start()
+```
+
+The agent then executes code in that session, where your loaded dataframes and fitted
+models already are, and sees the figures it draws. Run it in Positron, Jupyter, VS Code,
+or a bare REPL. Sessions announce themselves the same way R ones do, so `list_sessions`
+shows both and the agent connects to either by name:
+
+```
+Active sessions (2):
+  analysis [python] — port 8790, pid 8088, started 2026-09-09T10:50:09
+  modelling [r] — port 8787, pid 84615, started 2026-09-09T09:12:44
+```
+
+Start it once per session, the same as `claudeAddin()` in R. If the port is busy it moves
+to the next free one and tells you which it took.
+
+Every session needs its own name, because that is how the agent tells them apart.
+`clauder.start()` uses the name `default`, which is also what the R addin fills in for
+you. With an R session already running under that name, Python stops with
+
+```
+RuntimeError: Session name 'default' is already owned by a live or unknown process
+```
+
+Give the Python session a name of its own, and tell the agent to connect to that name:
+
+```python
+clauder.start(session_name = "analysis")
+```
+
+If you would rather not type it each time, run it from an IPython startup file:
+
+```python
+# ~/.ipython/profile_default/startup/50-clauder.py
+import clauder
+clauder.start(quiet=True)
+```
+
+That opens a server in every Python session you start, including ones you did not intend
+to expose to an agent, so it is off by default and worth thinking about before enabling.
+
+### What works where
+
+A Python session gets the live environment. It does not get the editor or the audit
+tooling, because those drive the IDE through `rstudioapi`, which has no Python equivalent.
+
+| | R | Python |
+|---|---|---|
+| Execute code in your live session | yes | yes |
+| Plots returned to the agent, and in your plot pane | yes | yes |
+| Per-agent log of every line executed | yes | yes |
+| Multi-agent coordination and the consensus gate | yes | yes |
+| Read and edit your open editor buffer | yes | no |
+| Approve-before-apply edits (`suggest_edit`) | yes | no |
+| Checkpoint and roll back the environment | yes | no |
+| Reviewer Zero and the audit tools | yes | no |
+
+R in a plain terminal, started with `start_server()`, has everything in the R column
+except the two editor rows. See [Terminal R and Clusters](#terminal-r-and-clusters).
+
+So "load this file, fit the model, plot the residuals" works in Python. "Look at the file
+I have open and fix that function" is R only. An agent can still read and write those
+files with its own file tools, it just cannot go through your editor buffer.
+
+### Positron notes
+
+R in Positron needs nothing special. Positron ships an `rstudioapi` compatibility layer,
+so the editor tools work there, with one difference: `suggest_edit` stages the change
+unsaved rather than using `showEditSuggestion()`, which Positron does not implement. You
+accept by saving or reject with undo.
+
+## Terminal R and Clusters
+
+You don't need RStudio. `start_server()` does what the addin's **Start Server** button does, from any R console:
+
+```r
+library(ClaudeR)
+start_server("analysis")
+```
+
+At an R prompt it returns straight away and the prompt stays yours. Agents are served whenever R is idle, and whatever they create is there for you to use. If your own code is running when an agent's request arrives, the request waits and runs the moment your code finishes. `stop_server()` stops it.
+
+For a session you leave alone, such as a tmux pane or a batch job on a cluster, run it from `Rscript`. There it serves until interrupted:
+
+```bash
+Rscript -e 'ClaudeR::start_server("fit", port = 8790)'
+```
+
+What differs from RStudio:
+
+- **No editor tools.** Reading and editing the open document needs an editor, so those four tools are left out of what the agent is offered. Everything else works: code, plots, checkpoints, logging, coordination, background jobs and the audit tools.
+- **Plots without a screen.** With no display, R's default graphics device is a PDF file, which the agent could never see. While the server runs, `start_server()` swaps in a hidden image device, so plots reach the agent the way they do from the Plots pane. If R does have a screen (terminal R on your laptop), plots open in a window as usual and the agent sees those.
+- **The bridge runs on the same machine as R.** It finds sessions through files in your home folder and talks to `127.0.0.1`, so run your AI tool on the machine R is on.
+
+`start_server()` also works inside RStudio and Positron, as an alternative to the addin window that leaves the console free. Running `claudeAddin()` later opens the window on the server that is already running.
+
 ## How It Works
 
 ClaudeR uses the **Model Context Protocol (MCP)** to create a bidirectional connection between an AI assistant and your RStudio environment. MCP is an open protocol from Anthropic that allows the AI to safely interact with local tools and data.
@@ -339,7 +486,7 @@ This architecture ensures that the AI can only perform approved operations throu
 
 ## CLI Integration
 
-ClaudeR supports command-line interface (CLI) agents: the **Claude Code CLI**, the **OpenAI Codex CLI**, the **Qwen Code CLI**, the **Google Antigravity CLI** (`agy`), and the legacy **Google Gemini CLI** (which shuts down June 18, 2026, with `agy` as its replacement). This is ideal for developers who prefer a terminal-based workflow, allowing you to interact with your AI assistant directly from the command line while maintaining a live connection to your RStudio session.
+ClaudeR supports command-line interface (CLI) agents: the **Claude Code CLI**, the **OpenAI Codex CLI**, the **Qwen Code CLI**, and the **Google Antigravity CLI** (`agy`). The Google Gemini CLI shut down on June 18, 2026, and `agy` replaced it. This is ideal for developers who prefer a terminal-based workflow, allowing you to interact with your AI assistant directly from the command line while maintaining a live connection to your RStudio session.
 
 ## Security Model
 
@@ -419,7 +566,7 @@ library(ClaudeR)
 install_clauder(use_uvx = FALSE, python_path = "/path/to/your/python")
 ```
 
-#### Option B: For CLI Tools (Claude Code / Codex / Gemini)
+#### Option B: For CLI Tools (Claude Code / Codex / Qwen / Antigravity)
 
 This non-interactive function generates the exact command or JSON configuration needed for your CLI tool.
 
@@ -437,9 +584,6 @@ install_cli(tools = "qwen")
 
 # For Google Antigravity CLI (agy, Gemini CLI's replacement)
 install_cli(tools = "agy")
-
-# For Google Gemini CLI (legacy, shuts down June 18, 2026)
-install_cli(tools = "gemini")
 ```
 
 For users who cannot use `uvx`, fall back to the legacy Python path method:
@@ -451,7 +595,6 @@ install_cli(tools = "claude", use_uvx = FALSE, python_path = "/path/to/my/python
 After running the function, you must **manually apply the configuration**:
 - **For Claude / Codex / Qwen**: Copy the command printed in the R console and run it in your terminal.
 - **For Antigravity (agy)**: Copy the generated JSON into `~/.gemini/config/mcp_config.json` (global) or `.agents/mcp_config.json` (per-workspace).
-- **For Gemini (legacy)**: Copy the generated JSON and manually add it to your `~/.gemini/settings.json` file.
 
 After setup, **quit and restart** any active Desktop Apps or terminal sessions for the new settings to load.
 
@@ -461,7 +604,7 @@ After setup, **quit and restart** any active Desktop Apps or terminal sessions f
 
 ### Part 1: In RStudio
 
-For **all** workflows, you must first start the ClaudeR server from RStudio.
+For **all** workflows, you must first start the ClaudeR server. Without RStudio, run `start_server()` from any R console instead (see [Terminal R and Clusters](#terminal-r-and-clusters)).
 
 ```r
 library(ClaudeR)
@@ -475,7 +618,7 @@ The ClaudeR add-in will appear in your RStudio Viewer pane. Click **"Start Serve
 ### Part 2: In Your AI Tool
 
 - **For Desktop Apps**: Open the Claude Desktop App or Cursor and begin your session.
-- **For CLI Tools**: Open your terminal and use the `claude` or `gemini` commands to start interacting with your AI assistant.
+- **For CLI Tools**: Open your terminal and use the `claude`, `codex`, `qwen` or `agy` commands to start interacting with your AI assistant.
 
 > Note: You can regain console/active document control by clicking the stop button in the RStudio console. This closes the Shiny UI but the MCP server keeps running in the background and your AI agents stay connected. Re-run `claudeAddin()` to bring the viewer pane back with the same server state (port, session name, execution count). To fully stop the server, click **"Stop Server"** in the UI before closing.
 
@@ -496,7 +639,7 @@ A new log file is created each time you click **Start Server**. All code execute
 - "Load the `mtcars` dataset and create a scatterplot of `mpg` vs. `hp` with a trend line."
 - "Fit a linear model to predict `mpg` based on `wt` and `hp`."
 - "Generate a correlation matrix for the `iris` dataset and visualize it."
-- "I have a qmd file active. Please make a nice quarto presentation on gradient descent. The audience is very technical. Make sure it looks smooth. Save the presentation in ./presentation-output/"
+- "I have a qmd file active. Please make a nice quarto presentation on gradient descent. The audience is very technical. Make sure it looks smooth. Save the presentation in ~/QuartoDocs/"
 
 If you can do it with R, your AI assistant can too.
 
@@ -524,8 +667,10 @@ If you can do it with R, your AI assistant can too.
     - Tell the AI to use the `execute_r_with_plot` function.
 - **Long-Running Code Timing Out**:
     - Ask the AI to use `execute_r_async` for code that takes longer than 25 seconds.
-    - The AI will automatically poll for results using `get_async_result`.
+    - The AI collects the result with `get_async_result`, which waits until the job is done.
     - Async jobs run in a separate R process via `callr` and do **not** have access to your main session's environment. The AI must write self-contained code that uses `saveRDS()` to pass data in and write results out, then loads them back into the main session after the job completes.
+- **"Session name 'default' is already owned by a live or unknown process"**:
+    - Another session, R or Python, is already running under that name. Each session needs its own. In Python, start with a name, e.g. `clauder.start(session_name = "analysis")`. In R, type a different name in the addin's Session Name box before pressing Start Server.
 - **Server Restart Issues**:
     - If you see an "address already in use" error after restarting the server, it's a UI bug. The server is still active. If you encounter connection issues, switch the port number in the Viewer Pane or restart RStudio.
     - If the AI still can't connect, click **"Force Release Port"** under the Advanced section. This force-kills whatever process is holding the port so you can start fresh.
@@ -537,6 +682,23 @@ If you can do it with R, your AI assistant can too.
 - Each R session can connect to one Claude Desktop/Cursor app at a time. However, multiple CLI agents (Claude Code, Codex, Qwen, agy) can share the same session alongside a Desktop app. To isolate agents, run separate RStudio windows with different session names and ports.
 - You can close the Shiny UI (Stop button in the console) to work alongside the AI. The server keeps running in the background and agents stay connected. Re-run `claudeAddin()` to bring the UI back, or click **Stop Server** in the UI to fully stop it.
 - R is single-threaded, but async jobs run in a separate process via `callr` so the main session stays responsive. The background process does not share the main session's environment, so async code must be self-contained.
+
+## Citation
+
+If ClaudeR contributes to published work, a citation is appreciated:
+
+```r
+citation("ClaudeR")
+```
+
+```
+Vitali, N. (2026). ClaudeR: Connect live RStudio and Python sessions to AI
+agents over MCP. R package version 0.16.6.
+https://github.com/IMNMV/ClaudeR
+```
+
+GitHub's "Cite this repository" button in the sidebar produces the same thing
+from `CITATION.cff`.
 
 ## License
 

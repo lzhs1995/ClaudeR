@@ -4,7 +4,12 @@
 \alias{execute_code_in_session}
 \title{Execute R code in the active RStudio session}
 \usage{
-execute_code_in_session(code, settings = NULL, agent_id = NULL)
+execute_code_in_session(
+  code,
+  settings = NULL,
+  agent_id = NULL,
+  want_plot = NULL
+)
 }
 \arguments{
 \item{code}{The R code to execute}
@@ -12,6 +17,9 @@ execute_code_in_session(code, settings = NULL, agent_id = NULL)
 \item{settings}{The settings list with logging preferences}
 
 \item{agent_id}{Optional agent identifier for attribution}
+
+\item{want_plot}{If TRUE, always return the plot, overriding the session's
+plot_auto setting. Used by the execute_r_with_plot tool.}
 }
 \value{
 A list containing the execution result and metadata

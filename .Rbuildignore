@@ -5,6 +5,7 @@ assets
 ^\.github$
 ^\.claude$
 ^clauder-mcp$
+^clauder-py$
 ^Dockerfile$
 ^glama\.json$
 ^llms-install\.md$
@@ -13,4 +14,7 @@ assets
 ^.*\.DS_Store$
 ^Rplots\.pdf$
 ^LICENSE\.md$
+^CITATION\.cff$
 ^\.mcpregistry_.*$
+^\.pytest_cache$
+^R/ui\.R\.bak_plotfix$

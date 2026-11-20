@@ -11,7 +11,7 @@ ClaudeR 透過 RStudio addin 與 Python MCP bridge，讓具備相容 MCP 介面�
 
 本儲存庫是 [IMNMV/ClaudeR](https://github.com/IMNMV/ClaudeR) 的維護分支，提供與 [clauder-rstudio-workbench](https://github.com/lzhs1995/clauder-rstudio-workbench) 配套的相容版本。英文 README 保留上游的功能說明、安裝方式及歷史更新；使用本維護分支時，先讀 [FORK_COMPATIBILITY.md](FORK_COMPATIBILITY.md)，依配套版本安裝。
 
-目前配套為 ClaudeR R 套件 `0.14.1.9002`、MCP bridge `0.14.5.post1`，對應標籤 [v0.14.1.9002-lzhs.1](https://github.com/lzhs1995/ClaudeR/releases/tag/v0.14.1.9002-lzhs.1)。R 套件與 bridge 須來自同一配套來源；不要將此 R 套件與未固定來源的 `uvx clauder-mcp` 混用。
+目前候選配套為 ClaudeR R 套件 `0.16.6.9001`、MCP bridge `0.16.6.post1` 與 workbench `0.7.0`。來源納入上游開發提交 `3b56327527919b307b5466c3647ecb004e27775f`，並保留維護分支的相容性修補。R 套件與 bridge 使用 workbench 的 `runtime-compatibility.json` 所固定的同一來源及關鍵檔案 SHA。完整發布驗收仍在進行。
 
 此分支保留非同步工作的階段／訊息／更新時間、檔案式標準輸出與錯誤輸出、codebook 寫入者偵測及 Copilot CLI 設定支援。會話探索使用非破壞式程序檢查與原子寫入；已綁定會話消失或身分改變時，停止向該目標派送，保留原工作與紀錄。
 
@@ -20,7 +20,8 @@ ClaudeR 透過 RStudio addin 與 Python MCP bridge，讓具備相容 MCP 介面�
 | 工作 | 入口與結果 |
 |---|---|
 | 在 RStudio 執行 R | MCP 執行工具回傳程式輸出；繪圖使用相應圖形工具 |
-| 追蹤長時間工作 | `execute_r_async` 建立工作；以原 `job_id` 呼叫 `get_async_result` |
+| 追蹤長時間工作 | `execute_r_async` 建立工作；以原 `job_id` 呼叫 `get_async_result`，`wait_s=0` 可立即讀取狀態 |
+| 終端 R 與協作消息 | `start_server()`／`stop_server()` 管理終端服務；`wake_on_message` 提供支援客戶端可監看完成的背景命令 |
 | 保存研究過程 | 執行日誌、工作階段檢查點、腳本與分析產物 |
 | 協作與文稿核對 | 協作提示、數值／引文核對及文稿審查工具；依實際功能及證據判定成果 |
 
@@ -28,23 +29,31 @@ ClaudeR 透過 RStudio addin 與 Python MCP bridge，讓具備相容 MCP 介面�
 
 ## 安裝配套版本
 
-先準備 Git、R、RStudio、Python 與 uv。以下沿用 workbench `v0.6.7` 的已發布安裝入口，安裝 ClaudeR、配套 bridge 與工作流程工具。目的目錄須尚未存在；已有安裝或進行中的研究工作應依其原版本接續。
+先準備 Git、R、RStudio、Python 3.14、uv 與所需 R 相依套件。取得同一候選交付的 workbench `0.7.0` 固定來源，以及其 `runtime-compatibility.json` 指定的 ClaudeR 來源。在 workbench 根目錄閱讀 `docs/UPGRADE_0.7.0.zh-TW.md`，依 `paired_release stage`、`verify` 流程建立隔離配對。兩個來源目錄及 manifest 的身分會寫入安裝回執。
+
+以下命令先顯示配套安裝與核驗參數。實際 `stage` 須指定交付來源、獨立版本目錄與本機 Python／R／Rscript 絕對路徑，並先核對預覽。
 
 ### macOS／Linux
 
 ```bash
-git clone --branch v0.14.1.9002-lzhs.1 --single-branch https://github.com/lzhs1995/ClaudeR.git "$HOME/projects/ClaudeR-v0.14.1.9002-lzhs.1"
-git clone --branch v0.6.7 --single-branch https://github.com/lzhs1995/clauder-rstudio-workbench.git "$HOME/projects/clauder-rstudio-workbench-v0.6.7"
-cd "$HOME/projects/clauder-rstudio-workbench-v0.6.7"
-./install.sh --clauder-dir "$HOME/projects/ClaudeR-v0.14.1.9002-lzhs.1" --configure-codex --sync-agents-skill
-"$HOME/.local/bin/clauder-workbench" doctor --expect-client codex --check-toml-parse
+export PYTHONPATH="$PWD/skills/clauder-rstudio-workbench"
+python3.14 -m clauder_workbench.paired_release stage --help
+python3.14 -m clauder_workbench.paired_release verify --help
 ```
 
-可先在安裝命令末尾加 `--dry-run` 檢查計畫。Claude Code 與 Copilot CLI 分別使用 `--configure-claude`、`--configure-copilot`；只選實際需要設定的客戶端。Linux 仍需可用的 RStudio／addin 工作階段。
+`stage` 預設產生計畫，加 `--apply` 才建立版本目錄。`verify` 會實際載入並核對 R 與 bridge。需要 RStudio 功能時，目標使用者仍須有可用的 RStudio／addin 工作階段。
 
 ### Windows
 
-使用 workbench 的 `install.ps1`，沿用同一配套版本。完整命令、前置條件與選項見 [workbench 繁中安裝說明](https://github.com/lzhs1995/clauder-rstudio-workbench/blob/985694b983f46e049fcaae16b621135fd686d252/README.zh-TW.md)及[英文快速安裝](https://github.com/lzhs1995/clauder-rstudio-workbench/blob/985694b983f46e049fcaae16b621135fd686d252/README.md#quick-start)。
+在 workbench 根目錄使用相同模組。下例以 Python Launcher 選擇已安裝的 Python 3.14。正式執行時依升級指南指定真正的 `python.exe`、`R.exe` 和 `Rscript.exe`。
+
+```powershell
+$env:PYTHONPATH = Join-Path (Get-Location) 'skills/clauder-rstudio-workbench'
+py -3.14 -m clauder_workbench.paired_release stage --help
+py -3.14 -m clauder_workbench.paired_release verify --help
+```
+
+成功的 `verify` 回執會提供該配對的 client command 與 R library。接著依使用中的客戶端設定入口，並核驗其實際載入與原生呼叫。候選來源、隔離安裝及客戶端接續步驟由配套指南維護。[Workbench 專案](https://github.com/lzhs1995/clauder-rstudio-workbench)
 
 ## 讓 agent 連接 RStudio
 
@@ -77,7 +86,9 @@ skills/clauder-rstudio-workbench/SKILL.md。列出可用 RStudio 會話，
 
 ## 已驗證範圍與使用界線
 
-以固定提交 [a61aac7a](https://github.com/lzhs1995/ClaudeR/commit/a61aac7ae40e2c8533f9469bba6e610e2dda3f02) 的 GitHub 紀錄為準：
+本候選已在 macOS 與 Windows 隔離安裝並載入 R `0.16.6.9001` 和 bridge `0.16.6.post1`。兩端獨立 MCP 客戶端均實際列出 42 個工具，包含 `wake_on_message` 與 `get_async_result` 的 `wait_s` 參數。正式發布、固定公開版本回下載、現役客戶端載入及完整研究流程驗收仍在進行。
+
+以下是歷史固定提交 [a61aac7a](https://github.com/lzhs1995/ClaudeR/commit/a61aac7ae40e2c8533f9469bba6e610e2dda3f02) 的 GitHub 紀錄。
 
 - [Windows／macOS／Ubuntu 的會話探索安全回歸](https://github.com/lzhs1995/ClaudeR/actions/runs/34123530374)均成功。
 - [R CMD check、R 解析與功能檢查、MCP bridge 建置及 stdio 握手](https://github.com/lzhs1995/ClaudeR/actions/runs/34123530376)均成功。

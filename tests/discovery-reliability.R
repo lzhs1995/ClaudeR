@@ -19,10 +19,13 @@ local({
   dir.create(root, mode = "0700")
   on.exit(unlink(root, recursive = TRUE), add = TRUE)
   env$discovery_dir <- function() root
+  env$load_claude_settings <- function() list(plot_auto=TRUE, tool_sets=c('core','edit'))
   write <- env$write_discovery_file
   write("A", 48878L, "test-token")
   f <- file.path(root, "A.json")
   original <- readLines(f)
+  info <- jsonlite::fromJSON(f)
+  stopifnot(isTRUE(info$plot_auto), identical(info$tool_sets, c('core','edit')))
   write("A", 48878L, "test-token")
   stopifnot(identical(original, readLines(f)))
   stopifnot(identical(env$pid_is_alive(Sys.getpid()), TRUE))

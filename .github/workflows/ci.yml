@@ -35,7 +35,7 @@ jobs:
         with:
           use-public-rspm: true
       - name: Install check dependencies
-        run: Rscript -e 'install.packages(c("jsonlite", "xml2", "zip"))'
+        run: Rscript -e 'install.packages(c("jsonlite", "xml2", "zip", "httpuv", "fs", "ps"))'
       - name: Run checks
         run: Rscript .github/scripts/checks.R
 
@@ -53,8 +53,8 @@ jobs:
       - name: Install wheel
         run: |
           uv venv smoke
-          uv pip install --python smoke/bin/python clauder-mcp/dist/*.whl pytest
+          uv pip install --python smoke/bin/python clauder-mcp/dist/*.whl ./clauder-py pytest matplotlib
       - name: Unit tests
-        run: smoke/bin/python -m pytest clauder-mcp/tests -q
+        run: smoke/bin/python -m pytest clauder-mcp/tests clauder-py/tests -q
       - name: stdio initialize + tools/list handshake
         run: timeout 60 python3 .github/scripts/handshake.py smoke/bin/clauder-mcp
